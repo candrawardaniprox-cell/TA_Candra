@@ -128,10 +128,10 @@ def train_one_epoch(
         scaler.update()
 
         # Accumulate losses
-        total_loss += loss.item()
-        total_obj_loss += losses['obj_loss'].item()
-        total_bbox_loss += losses['bbox_loss'].item()
-        total_class_loss += losses['class_loss'].item()
+        total_loss += loss.item() if isinstance(loss, torch.Tensor) else loss
+        total_obj_loss += losses['obj_loss'].item() if isinstance(losses['obj_loss'], torch.Tensor) else losses['obj_loss']
+        total_bbox_loss += losses['bbox_loss'].item() if isinstance(losses['bbox_loss'], torch.Tensor) else losses['bbox_loss']
+        total_class_loss += losses['class_loss'].item() if isinstance(losses['class_loss'], torch.Tensor) else losses['class_loss']
         num_batches += 1
 
         # Update progress bar

@@ -274,9 +274,9 @@ class DetectionLoss(nn.Module):
         device = predictions['objectness'].device
 
         # Extract predictions
-        pred_obj = predictions['objectness']  # [B, A, H, W, 1]
-        pred_boxes = predictions['boxes']  # [B, A, H, W, 4]
-        pred_classes = predictions['class_scores']  # [B, A, H, W, C]
+        pred_obj_logits = predictions['predictions'][..., 0:1] 
+        pred_boxes = predictions['boxes']  # Keep decoded boxes for GIoU/MSE loss
+        pred_classes_logits = predictions['predictions'][..., 5:]
 
         # Initialize loss accumulators
         total_obj_loss = 0.0
@@ -287,9 +287,9 @@ class DetectionLoss(nn.Module):
         # Process each image in batch
         for b in range(batch_size):
             # Flatten spatial and anchor dimensions
-            obj_b = pred_obj[b].reshape(-1)  # [A*H*W]
-            boxes_b = pred_boxes[b].reshape(-1, 4)  # [A*H*W, 4]
-            classes_b = pred_classes[b].reshape(-1, self.num_classes)  # [A*H*W, C]
+            obj_logits_b = pred_obj_logits[b].reshape(-1) 
+            boxes_b = pred_boxes[b].reshape(-1, 4)  
+            classes_logits_b = pred_classes_logits[b].reshape(-1, self.num_classes)
 
             # Get targets for this image
             target_boxes_b = targets['boxes'][b].to(device)  # [M, 4]
@@ -300,8 +300,8 @@ class DetectionLoss(nn.Module):
                 self.assign_anchors_to_targets(boxes_b, target_boxes_b, target_labels_b)
 
             # Objectness loss (all anchors)
-            obj_loss = F.binary_cross_entropy(
-                obj_b, obj_target, reduction='sum'
+            obj_loss = F.binary_cross_entropy_with_logits(
+                obj_logits_b, obj_target, reduction='mean'
             )
 
             # Weight positive and negative anchors differently
@@ -336,12 +336,12 @@ class DetectionLoss(nn.Module):
 
                 if self.use_focal_loss:
                     class_loss = self.focal_loss(
-                        classes_b[pos_mask],
+                        classes_logits_b[pos_mask],
                         class_target_onehot
                     ) * pos_mask.sum()
                 else:
-                    class_loss = F.binary_cross_entropy(
-                        classes_b[pos_mask],
+                    class_loss = F.binary_cross_entropy_with_logits(
+                        classes_logits_b[pos_mask],
                         class_target_onehot,
                         reduction='sum'
                     )

@@ -43,7 +43,7 @@ class Config:
     # ==================== Training Configuration ====================
     # Optimization
     BATCH_SIZE = 32  # Adjusted for RTX 3060 12GB VRAM
-    LEARNING_RATE = 1e-3
+    LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-3
     EPOCHS = 5
     WARMUP_EPOCHS = 3
@@ -77,14 +77,14 @@ class Config:
     IOU_THRESHOLD_NEG = 0.4  # IoU < 0.4 = negative anchor
 
     # ==================== Inference Configuration ====================
-    CONF_THRESHOLD = 0.5  # Confidence threshold for detection
+    CONF_THRESHOLD = 0.1  # Confidence threshold for detection
     NMS_IOU_THRESHOLD = 0.45  # IoU threshold for NMS
     MAX_DETECTIONS = 100  # Maximum number of detections per image
 
     # ==================== Data Configuration ====================
-    # Dataset paths
+    
     DATA_ROOT = Path("data") / "coco copy"
-    TRAIN_IMAGES = DATA_ROOT / "val2017"  # Using val2017 for training (for now)
+    TRAIN_IMAGES = DATA_ROOT / "train2017"  
     VAL_IMAGES = DATA_ROOT / "val2017"
     TRAIN_ANNOTATIONS = DATA_ROOT / "annotations_coco" / "instances_train2017.json"
     VAL_ANNOTATIONS = DATA_ROOT / "annotations_coco" / "instances_val2017.json"

@@ -176,9 +176,12 @@ class DetectionHead(nn.Module):
         # Decode bounding boxes
         # x, y: apply sigmoid and add grid offset, then scale to image size
         bbox_xy = torch.sigmoid(bbox_pred[..., :2])  # [B, A, H, W, 2]
-        bbox_xy[..., 0] += grid_x.unsqueeze(0).unsqueeze(0)  # Add grid_x
-        bbox_xy[..., 1] += grid_y.unsqueeze(0).unsqueeze(0)  # Add grid_y
-        bbox_xy = bbox_xy / grid_size * image_size  # Scale to image coordinates
+        
+        # Gabungkan grid_x dan grid_y, lalu jumlahkan tanpa +=
+        grid_offset = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).unsqueeze(0)
+        bbox_xy = bbox_xy + grid_offset  # <-- Perhatikan penggunaan + alih-alih +=
+        
+        bbox_xy = bbox_xy / grid_size * image_size
 
         # w, h: apply exponential and multiply by anchor dimensions, then scale
         anchor_tensor = torch.tensor(anchors, device=device).view(1, num_anchors, 1, 1, 2)

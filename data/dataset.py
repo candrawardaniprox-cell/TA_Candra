@@ -149,68 +149,69 @@ class ObjectDetectionDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict:
         """
         Get a single data sample.
-
-        Args:
-            idx: Index of the sample
-
-        Returns:
-            Dictionary or tuple containing:
-            - image: Tensor of shape [3, H, W]
-            - boxes: Tensor of shape [N, 4] in format (x_center, y_center, w, h)
-            - labels: Tensor of shape [N] with class indices
-            - image_id: Original COCO image ID
         """
-        image_id = self.image_ids[idx]
+        try:
+            image_id = self.image_ids[idx]
 
-        # Load image and annotations
-        image = self._load_image(image_id)
-        boxes, labels = self._parse_annotations(image_id)
+            # Load image and annotations
+            image = self._load_image(image_id)
+            boxes, labels = self._parse_annotations(image_id)
 
-        # Apply transformations
-        if self.transform is not None:
-            # Albumentations expects boxes in [x_min, y_min, x_max, y_max] format
-            # Convert from center format
-            boxes_xyxy = np.zeros_like(boxes)
-            boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2  # x_min
-            boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2  # y_min
-            boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2  # x_max
-            boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2  # y_max
+            # Apply transformations
+            if self.transform is not None:
+                # Albumentations expects boxes in [x_min, y_min, x_max, y_max] format
+                # Convert from center format
+                boxes_xyxy = np.zeros_like(boxes)
+                boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2  # x_min
+                boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2  # y_min
+                boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2  # x_max
+                boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2  # y_max
 
-            transformed = self.transform(
-                image=image,
-                bboxes=boxes_xyxy,
-                labels=labels
-            )
+                transformed = self.transform(
+                    image=image,
+                    bboxes=boxes_xyxy,
+                    labels=labels
+                )
 
-            image = transformed['image']
-            boxes_xyxy = np.array(transformed['bboxes'], dtype=np.float32)
-            labels = np.array(transformed['labels'], dtype=np.int64)
+                image = transformed['image']
+                boxes_xyxy = np.array(transformed['bboxes'], dtype=np.float32)
+                labels = np.array(transformed['labels'], dtype=np.int64)
 
-            # Convert boxes back to center format
-            if len(boxes_xyxy) > 0:
-                boxes = np.zeros_like(boxes_xyxy)
-                boxes[:, 0] = (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]) / 2  # x_center
-                boxes[:, 1] = (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]) / 2  # y_center
-                boxes[:, 2] = boxes_xyxy[:, 2] - boxes_xyxy[:, 0]  # width
-                boxes[:, 3] = boxes_xyxy[:, 3] - boxes_xyxy[:, 1]  # height
+                # Convert boxes back to center format
+                if len(boxes_xyxy) > 0:
+                    boxes = np.zeros_like(boxes_xyxy)
+                    boxes[:, 0] = (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]) / 2  # x_center
+                    boxes[:, 1] = (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]) / 2  # y_center
+                    boxes[:, 2] = boxes_xyxy[:, 2] - boxes_xyxy[:, 0]  # width
+                    boxes[:, 3] = boxes_xyxy[:, 3] - boxes_xyxy[:, 1]  # height
+                else:
+                    boxes = np.zeros((0, 4), dtype=np.float32)
+
+            # Convert to tensors
+            image = torch.from_numpy(image).permute(2, 0, 1).float()  # [C, H, W]
+            boxes = torch.from_numpy(boxes).float()
+            labels = torch.from_numpy(labels).long()
+
+            if self.return_dict:
+                return {
+                    'image': image,
+                    'boxes': boxes,
+                    'labels': labels,
+                    'image_id': image_id
+                }
             else:
-                boxes = np.zeros((0, 4), dtype=np.float32)
-
-        # Convert to tensors
-        image = torch.from_numpy(image).permute(2, 0, 1).float()  # [C, H, W]
-        boxes = torch.from_numpy(boxes).float()
-        labels = torch.from_numpy(labels).long()
-
-        if self.return_dict:
-            return {
-                'image': image,
-                'boxes': boxes,
-                'labels': labels,
-                'image_id': image_id
-            }
-        else:
-            return image, boxes, labels, image_id
-
+                return image, boxes, labels, image_id
+                
+        except (FileNotFoundError, OSError, Exception) as e:
+            # JIKA FILE TIDAK DITEMUKAN ATAU CORRUPT:
+            # Print warning dan panggil ulang fungsi ini dengan index random lain
+            import random
+            print(f"\nWarning: Gagal memuat gambar (ID/Index {idx}). Pesan Error: {e}. Mengganti dengan sample lain.")
+            
+            # Ambil index acak yang baru
+            new_idx = random.randint(0, len(self) - 1)
+            return self.__getitem__(new_idx)
+        
     def get_image_info(self, idx: int) -> Dict:
         """
         Get metadata for an image.
