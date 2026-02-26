@@ -76,7 +76,7 @@ class ObjectDetector:
             dropout=Config.TRANSFORMER_DROPOUT
         )
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         model = model.to(self.device)
 

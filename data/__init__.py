@@ -8,13 +8,15 @@ This module contains:
 """
 
 from .dataset import ObjectDetectionDataset
-from .transforms import get_train_transforms, get_val_transforms
+# PERUBAHAN DI SINI: Tambahkan get_inference_transforms
+from .transforms import get_train_transforms, get_val_transforms, get_inference_transforms
 from .utils import collate_fn, create_dataloaders
 
 __all__ = [
     'ObjectDetectionDataset',
     'get_train_transforms',
     'get_val_transforms',
+    'get_inference_transforms',  # PERUBAHAN DI SINI: Tambahkan ini juga
     'collate_fn',
     'create_dataloaders',
 ]

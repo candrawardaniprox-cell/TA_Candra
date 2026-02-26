@@ -79,7 +79,7 @@ class Config:
     IOU_THRESHOLD_NEG = 0.4  # IoU < 0.4 = negative anchor
 
     # ==================== Inference Configuration ====================
-    CONF_THRESHOLD = 0.1  # Confidence threshold for detection
+    CONF_THRESHOLD = 0.05  # Confidence threshold for detection
     NMS_IOU_THRESHOLD = 0.45  # IoU threshold for NMS
     MAX_DETECTIONS = 100  # Maximum number of detections per image
 
