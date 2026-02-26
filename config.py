@@ -25,19 +25,21 @@ class Config:
     # Transformer settings
     TRANSFORMER_DIM = 256  # Must match last BACKBONE_CHANNELS value
     TRANSFORMER_HEADS = 8  # Number of attention heads
-    TRANSFORMER_LAYERS = 2  # Number of transformer encoder layers
+    TRANSFORMER_LAYERS = 4  # Number of transformer encoder layers
     TRANSFORMER_FF_DIM = 1024  # Feed-forward network dimension
     TRANSFORMER_DROPOUT = 0.1
 
     # Detection Head settings
     GRID_SIZE = 20  # Output grid size (IMAGE_SIZE / 16 = 320 / 16 = 20)
-    NUM_ANCHORS = 3  # Number of anchor boxes per grid cell
+    NUM_ANCHORS = 5  # Number of anchor boxes per grid cell
 
     # Anchor boxes (width, height) relative to grid cell - optimized for COCO
     ANCHOR_BOXES = [
-        (0.28, 0.22),  # Small objects
-        (0.38, 0.48),  # Medium objects
-        (0.90, 0.78),  # Large objects
+        (0.15, 0.15),  # Objek sangat kecil
+        (0.30, 0.30),  # Objek kecil
+        (0.50, 0.50),  # Objek sedang
+        (0.75, 0.75),  # Objek besar
+        (0.90, 0.90),  # Objek memenuhi layar
     ]
 
     # ==================== Training Configuration ====================
@@ -45,7 +47,7 @@ class Config:
     BATCH_SIZE = 32  # Adjusted for RTX 3060 12GB VRAM
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-3
-    EPOCHS = 5
+    EPOCHS = 50
     WARMUP_EPOCHS = 3
 
     # Learning rate schedule

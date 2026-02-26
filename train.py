@@ -309,7 +309,7 @@ def load_checkpoint(checkpoint_path: str, model: nn.Module, optimizer=None, sche
     Returns:
         Epoch number and metrics from checkpoint
     """
-    checkpoint = torch.load(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
 
     model.load_state_dict(checkpoint['model_state_dict'])
 

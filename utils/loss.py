@@ -94,51 +94,23 @@ def generalized_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Ten
 
 
 class FocalLoss(nn.Module):
-    """
-    Focal Loss for addressing class imbalance.
-
-    Focal loss down-weights easy examples and focuses training on hard examples.
-    Particularly useful for object detection where background dominates.
-
-    Args:
-        alpha: Weighting factor in range (0, 1)
-        gamma: Exponent of the modulating factor (1 - p_t)^gamma
-    """
-
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
 
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Calculate focal loss.
-
-        Args:
-            inputs: Predictions (logits or probabilities) [N, C]
-            targets: Ground truth class indices [N]
-
-        Returns:
-            Focal loss value
-        """
-        # Get probabilities
-        p = torch.sigmoid(inputs) if inputs.dim() > 1 else inputs
-
-        # Calculate cross entropy
+    def forward(self, inputs_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Gunakan raw logits agar tidak terjadi double sigmoid
+        p = torch.sigmoid(inputs_logits)
         ce_loss = F.binary_cross_entropy_with_logits(
-            inputs, targets, reduction='none'
-        ) if inputs.dim() > 1 else F.binary_cross_entropy(inputs, targets, reduction='none')
+            inputs_logits, targets, reduction='none'
+        )
 
-        # Calculate focal weight
         p_t = p * targets + (1 - p) * (1 - targets)
         focal_weight = (1 - p_t) ** self.gamma
-
-        # Apply alpha weighting
         alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
 
-        # Calculate focal loss
         focal_loss = alpha_t * focal_weight * ce_loss
-
         return focal_loss.mean()
 
 
@@ -254,73 +226,57 @@ class DetectionLoss(nn.Module):
         predictions: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """
-        Calculate complete detection loss.
-
-        Args:
-            predictions: Dictionary containing model outputs
-                - 'predictions': Raw predictions [B, A, H, W, 5+C]
-                - 'objectness': Decoded objectness [B, A, H, W, 1]
-                - 'boxes': Decoded boxes [B, A, H, W, 4]
-                - 'class_scores': Decoded class scores [B, A, H, W, C]
-            targets: Dictionary containing ground truth
-                - 'boxes': List of [M, 4] tensors (one per image)
-                - 'labels': List of [M] tensors (one per image)
-
-        Returns:
-            Dictionary containing individual and total losses
-        """
+        
         batch_size = predictions['objectness'].shape[0]
         device = predictions['objectness'].device
 
-        # Extract predictions
-        pred_obj_logits = predictions['predictions'][..., 0:1] 
-        pred_boxes = predictions['boxes']  # Keep decoded boxes for GIoU/MSE loss
-        pred_classes_logits = predictions['predictions'][..., 5:]
+        # PERBAIKAN 1: Ekstrak RAW LOGITS untuk stabilitas kalkulasi (mencegah error AMP)
+        pred_raw = predictions['predictions']  # [B, A, H, W, 5+C]
+        pred_boxes = predictions['boxes']      # [B, A, H, W, 4] (Kotak yang sudah di-decode untuk hitung IoU)
 
-        # Initialize loss accumulators
-        total_obj_loss = 0.0
-        total_bbox_loss = 0.0
-        total_class_loss = 0.0
+        pred_obj_logits = pred_raw[..., 0]     
+        pred_class_logits = pred_raw[..., 5:]  
+
+        # PERBAIKAN 2: Inisialisasi sebagai Tensor sejak awal agar mencegah error "has no attribute 'item'"
+        total_obj_loss = torch.tensor(0.0, device=device)
+        total_bbox_loss = torch.tensor(0.0, device=device)
+        total_class_loss = torch.tensor(0.0, device=device)
         num_positive_anchors = 0
 
-        # Process each image in batch
         for b in range(batch_size):
-            # Flatten spatial and anchor dimensions
             obj_logits_b = pred_obj_logits[b].reshape(-1) 
             boxes_b = pred_boxes[b].reshape(-1, 4)  
-            classes_logits_b = pred_classes_logits[b].reshape(-1, self.num_classes)
+            classes_logits_b = pred_class_logits[b].reshape(-1, self.num_classes) 
 
-            # Get targets for this image
-            target_boxes_b = targets['boxes'][b].to(device)  # [M, 4]
-            target_labels_b = targets['labels'][b].to(device)  # [M]
+            target_boxes_b = targets['boxes'][b].to(device)  
+            target_labels_b = targets['labels'][b].to(device)  
 
-            # Assign anchors to targets
             obj_target, bbox_target, class_target, pos_mask = \
                 self.assign_anchors_to_targets(boxes_b, target_boxes_b, target_labels_b)
 
-            # Objectness loss (all anchors)
+            # PERBAIKAN 3: Harus pakai reduction='none' agar mask bisa dikalikan secara akurat (elemen per elemen)
             obj_loss = F.binary_cross_entropy_with_logits(
-                obj_logits_b, obj_target, reduction='mean'
+                obj_logits_b, obj_target, reduction='none'
             )
 
-            # Weight positive and negative anchors differently
             pos_obj_loss = obj_loss * pos_mask.float() * self.lambda_obj
             neg_obj_loss = obj_loss * (~pos_mask).float() * self.lambda_noobj
-            total_obj_loss += (pos_obj_loss.sum() + neg_obj_loss.sum())
+            
+            # Rata-rata per jumlah total anchor agar skalanya stabil (~0.5)
+            num_anchors = obj_logits_b.shape[0]
+            total_obj_loss += (pos_obj_loss.sum() + neg_obj_loss.sum()) / num_anchors
 
-            # Bounding box and classification loss (only positive anchors)
             if pos_mask.sum() > 0:
-                num_positive_anchors += pos_mask.sum().item()
+                num_pos = pos_mask.sum().item()
+                num_positive_anchors += num_pos
 
-                # Bounding box loss
                 if self.bbox_loss_type == 'giou':
                     giou = generalized_box_iou(
                         boxes_b[pos_mask],
                         bbox_target[pos_mask]
                     )
                     bbox_loss = (1 - giou).sum()
-                else:  # MSE
+                else:  
                     bbox_loss = F.mse_loss(
                         boxes_b[pos_mask],
                         bbox_target[pos_mask],
@@ -328,7 +284,6 @@ class DetectionLoss(nn.Module):
                     )
                 total_bbox_loss += bbox_loss
 
-                # Classification loss
                 class_target_onehot = F.one_hot(
                     class_target[pos_mask],
                     num_classes=self.num_classes
@@ -338,7 +293,7 @@ class DetectionLoss(nn.Module):
                     class_loss = self.focal_loss(
                         classes_logits_b[pos_mask],
                         class_target_onehot
-                    ) * pos_mask.sum()
+                    ) * num_pos
                 else:
                     class_loss = F.binary_cross_entropy_with_logits(
                         classes_logits_b[pos_mask],
@@ -347,7 +302,6 @@ class DetectionLoss(nn.Module):
                     )
                 total_class_loss += class_loss
 
-        # Normalize by batch size and number of positive anchors
         num_positive_anchors = max(num_positive_anchors, 1)
 
         obj_loss_avg = total_obj_loss / batch_size
@@ -361,7 +315,7 @@ class DetectionLoss(nn.Module):
             'obj_loss': obj_loss_avg,
             'bbox_loss': bbox_loss_avg,
             'class_loss': class_loss_avg,
-            'num_pos': num_positive_anchors
+            'num_pos': torch.tensor(num_positive_anchors, dtype=torch.float32, device=device)
         }
 
 
