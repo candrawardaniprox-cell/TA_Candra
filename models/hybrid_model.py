@@ -12,7 +12,7 @@ from typing import Dict, List, Tuple, Optional
 from .backbone import CNNBackbone
 from .transformer import TransformerEncoder
 from .detection_head import DetectionHead
-
+from utils.nms import batched_nms
 
 class HybridDetector(nn.Module):
     """
@@ -210,16 +210,20 @@ class HybridDetector(nn.Module):
             filtered_scores = scores[mask]  # [N]
             filtered_classes = class_preds[mask].cpu()  # [N]
 
-            # Apply NMS (will be implemented in utils/nms.py)
-            # For now, just sort by score and take top-k
-            sorted_indices = torch.argsort(filtered_scores, descending=True)
-            sorted_indices = sorted_indices[:max_detections]
+            # Apply NMS untuk menyaring kotak yang menumpuk
+            final_boxes, final_scores, final_classes = batched_nms(
+             filtered_boxes,
+             filtered_scores,
+             filtered_classes,
+             iou_threshold=nms_iou_threshold,
+             max_detections=max_detections
+         )
 
             detections.append({
-                'boxes': filtered_boxes[sorted_indices],
-                'scores': filtered_scores[sorted_indices],
-                'classes': filtered_classes[sorted_indices]
-            })
+             'boxes': final_boxes,
+             'scores': final_scores,
+             'classes': final_classes
+         })
 
         return detections
 

@@ -6,23 +6,17 @@ class CNNBackbone(nn.Module):
     def __init__(self, channels=None, kernel_size=None, padding=None):
         super().__init__()
         
-        # 1. Download ResNet18 yang sudah "Pintar" (Pre-trained ImageNet)
         resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        
-        # 2. Potong ResNet18 hanya sampai 'layer3'
-        # Ini secara ajaib akan menghasilkan output 256 channels dan ukuran 32x32
-        # (Sangat sempurna untuk masuk ke Transformer Encoder Anda)
         self.backbone = nn.Sequential(
-            resnet.conv1,
-            resnet.bn1,
-            resnet.relu,
-            resnet.maxpool,
-            resnet.layer1,  # Output: 64 channels
-            resnet.layer2,  # Output: 128 channels
-            resnet.layer3   # Output: 256 channels
+            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
+            resnet.layer1, resnet.layer2, resnet.layer3
         )
-        
         self.out_channels = 256
+
+        # --- TAMBAHKAN 2 BARIS INI UNTUK MEMBEKUKAN RESNET ---
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        # -----------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(x)

@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from pathlib import Path
 import argparse
 import logging
@@ -110,7 +110,7 @@ def train_one_epoch(
         images = images.to(device)
 
         # Forward pass with mixed precision
-        with autocast(enabled=Config.USE_AMP):
+        with autocast(device_type='cuda', enabled=Config.USE_AMP):
             outputs = model(images)
             losses = criterion(outputs, targets)
             loss = losses['total_loss']
@@ -202,7 +202,7 @@ def validate(
         images = images.to(device)
 
         # Forward pass
-        with autocast(enabled=Config.USE_AMP):
+        with autocast(device_type='cuda', enabled=Config.USE_AMP):
             outputs = model(images)
             losses = criterion(outputs, targets)
 
@@ -313,12 +313,12 @@ def load_checkpoint(checkpoint_path: str, model: nn.Module, optimizer=None, sche
 
     model.load_state_dict(checkpoint['model_state_dict'])
 
-    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    #if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
-    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-        if checkpoint['scheduler_state_dict'] is not None:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    #if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        #if checkpoint['scheduler_state_dict'] is not None:
+            #scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
     epoch = checkpoint.get('epoch', 0)
     metrics = checkpoint.get('metrics', {})
@@ -455,7 +455,7 @@ def train(args):
         )
 
     # Create scaler for mixed precision
-    scaler = GradScaler(enabled=Config.USE_AMP)
+    scaler = GradScaler('cuda', enabled=Config.USE_AMP)
 
     # Setup tensorboard
     writer = None

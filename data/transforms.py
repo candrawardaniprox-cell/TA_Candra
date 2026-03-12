@@ -11,7 +11,7 @@ from typing import Callable
 
 
 def get_train_transforms(
-    image_size: int = 320,
+    image_size: int = 512,  
     mean: tuple = (0.485, 0.456, 0.406),
     std: tuple = (0.229, 0.224, 0.225),
     h_flip_prob: float = 0.5,
@@ -20,33 +20,14 @@ def get_train_transforms(
 ) -> Callable:
     """
     Get training data augmentation pipeline.
-
-    The pipeline includes:
-    - Random horizontal flip
-    - Random brightness/contrast adjustment
-    - Random hue/saturation/value adjustment
-    - Resize to target size
-    - Normalization
-    - Conversion to tensor
-
-    All transforms properly handle bounding box coordinates.
-
-    Args:
-        image_size: Target image size (square)
-        mean: Mean values for normalization (ImageNet default)
-        std: Standard deviation for normalization (ImageNet default)
-        h_flip_prob: Probability of horizontal flip
-        brightness_contrast_limit: Limit for brightness/contrast adjustment
-        hue_saturation_limit: Limit for HSV adjustment
-
-    Returns:
-        Albumentations transform pipeline
     """
     return A.Compose([
-        # Geometric augmentations
+        # --- 1. Geometric augmentations (Pergerakan Posisi & Rotasi) ---
         A.HorizontalFlip(p=h_flip_prob),
+        A.VerticalFlip(p=0.2), 
+        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, p=0.5), 
 
-        # Color augmentations
+        # --- 2. Color augmentations (Pencahayaan) ---
         A.RandomBrightnessContrast(
             brightness_limit=brightness_contrast_limit,
             contrast_limit=brightness_contrast_limit,
@@ -59,26 +40,26 @@ def get_train_transforms(
             p=0.5
         ),
 
-        # Additional augmentations for robustness
+        # --- 3. Additional augmentations for robustness (Efek Kamera) ---
         A.OneOf([
             A.MotionBlur(p=1.0),
             A.GaussianBlur(p=1.0),
             A.GaussNoise(p=1.0),
         ], p=0.2),
 
-        # Resize to target size
+        # --- 4. Resize to target size ---
         A.Resize(height=image_size, width=image_size, p=1.0),
 
-        # Normalization
-        A.Normalize(mean=mean, std=std, p=1.0),
+        # --- 5. Normalization ---
+        A.Normalize(mean=mean, std=std, p=1.0)
+        # ToTensorV2() TELAH DIHAPUS DARI SINI
     ],
     bbox_params=A.BboxParams(
-        format='pascal_voc',  # [x_min, y_min, x_max, y_max]
+        format='pascal_voc',  
         label_fields=['labels'],
-        min_visibility=0.3,  # Remove boxes with < 30% visibility after augmentation
+        min_visibility=0.3,  
         min_area=0.0
     ))
-
 
 def get_val_transforms(
     image_size: int = 320,

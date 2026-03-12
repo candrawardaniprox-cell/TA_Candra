@@ -46,9 +46,9 @@ class Config:
     # ==================== Training Configuration ====================
     # Optimization
     BATCH_SIZE = 8  # Adjusted for RTX 3060 12GB VRAM
-    LEARNING_RATE = 5e-5
+    LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-3
-    EPOCHS = 50
+    EPOCHS = 150
     WARMUP_EPOCHS = 3
 
     # Learning rate schedule
