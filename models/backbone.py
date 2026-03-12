@@ -14,8 +14,8 @@ class CNNBackbone(nn.Module):
         self.out_channels = 256
 
         # --- TAMBAHKAN 2 BARIS INI UNTUK MEMBEKUKAN RESNET ---
-        for param in self.backbone.parameters():
-            param.requires_grad = False
+        #for param in self.backbone.parameters():
+        #    param.requires_grad = False
         # -----------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
