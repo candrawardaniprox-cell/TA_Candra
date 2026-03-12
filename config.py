@@ -14,8 +14,8 @@ class Config:
 
     # ==================== Model Architecture ====================
     # Input/Output specifications
-    IMAGE_SIZE = 320  # Input image resolution (320x320)
-    NUM_CLASSES = 80  # Number of object classes (COCO default)
+    IMAGE_SIZE = 512  # Input image resolution (320x320)
+    NUM_CLASSES = 4  # Number of object classes (COCO default)
 
     # CNN Backbone settings
     BACKBONE_CHANNELS = [3, 32, 64, 128, 256]  # Progressive channel expansion
@@ -30,24 +30,25 @@ class Config:
     TRANSFORMER_DROPOUT = 0.1
 
     # Detection Head settings
-    GRID_SIZE = 20  # Output grid size (IMAGE_SIZE / 16 = 320 / 16 = 20)
-    NUM_ANCHORS = 5  # Number of anchor boxes per grid cell
+    GRID_SIZE = 32  # Output grid size (IMAGE_SIZE / 16 = 320 / 16 = 20)
+    NUM_ANCHORS = 7  # Number of anchor boxes per grid cell
 
     # Anchor boxes (width, height) relative to grid cell - optimized for COCO
     ANCHOR_BOXES = [
-        (0.15, 0.15),  # Objek sangat kecil
-        (0.30, 0.30),  # Objek kecil
-        (0.50, 0.50),  # Objek sedang
-        (0.75, 0.75),  # Objek besar
-        (0.90, 0.90),  # Objek memenuhi layar
+        (0.15, 0.75),  # Tipis & tinggi (vertikal)
+        (0.75, 0.15),  # Tipis & lebar (horizontal)
+        (0.20, 0.60),  # Agak tipis & tinggi
+        (0.60, 0.20),  # Agak tipis & lebar
+        (0.25, 0.40),  # Sedang vertikal
+        (0.40, 0.25),  # Sedang horizontal
+        (0.35, 0.35),  # Persegi (untuk ulat/bercak)
     ]
-
     # ==================== Training Configuration ====================
     # Optimization
-    BATCH_SIZE = 32  # Adjusted for RTX 3060 12GB VRAM
+    BATCH_SIZE = 8  # Adjusted for RTX 3060 12GB VRAM
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-3
-    EPOCHS = 50
+    EPOCHS = 30
     WARMUP_EPOCHS = 3
 
     # Learning rate schedule
@@ -59,7 +60,7 @@ class Config:
     GRAD_CLIP_NORM = 1.0
 
     # Mixed precision training
-    USE_AMP = True  # Automatic Mixed Precision for RTX 3060
+    USE_AMP = False  # Automatic Mixed Precision for RTX 3060
 
     # ==================== Loss Configuration ====================
     # Loss weights
@@ -75,8 +76,8 @@ class Config:
     FOCAL_GAMMA = 2.0
 
     # IoU thresholds for anchor assignment
-    IOU_THRESHOLD_POS = 0.5  # IoU > 0.5 = positive anchor
-    IOU_THRESHOLD_NEG = 0.4  # IoU < 0.4 = negative anchor
+    IOU_THRESHOLD_POS = 0.3  # IoU > 0.5 = positive anchor
+    IOU_THRESHOLD_NEG = 0.2  # IoU < 0.4 = negative anchor
 
     # ==================== Inference Configuration ====================
     CONF_THRESHOLD = 0.01  # Confidence threshold for detection
@@ -129,18 +130,7 @@ class Config:
 
     # ==================== COCO Class Names ====================
     COCO_CLASSES = [
-        'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck',
-        'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench',
-        'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra',
-        'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
-        'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
-        'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup',
-        'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
-        'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
-        'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
-        'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
-        'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
-        'toothbrush'
+        'sehat', 'slabung', 'moler', 'ulat_grayak'
     ]
 
     @classmethod

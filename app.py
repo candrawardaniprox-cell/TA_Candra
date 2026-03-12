@@ -180,8 +180,8 @@ def main():
             st.sidebar.success("✓ Model loaded successfully!")
             with st.sidebar.expander("Model Information"):
                 st.write("**Architecture:** Hybrid CNN-Transformer")
-                st.write("**Image Size:** 320×320")
-                st.write("**Classes:** 80 COCO categories")
+                st.write("**Image Size:** 512×512")
+                st.write("**Classes:** 4 COCO categories")
                 st.write("**Parameters:** ~10M")
                 st.write("**Backbone:** ResNet-50")
                 st.write("**Transformer Layers:** 2")
