@@ -35,20 +35,20 @@ class Config:
 
     # Anchor boxes (width, height) relative to grid cell - optimized for COCO
     ANCHOR_BOXES = [
-        (0.15, 0.75),  # Tipis & tinggi (vertikal)
-        (0.75, 0.15),  # Tipis & lebar (horizontal)
-        (0.20, 0.60),  # Agak tipis & tinggi
-        (0.60, 0.20),  # Agak tipis & lebar
-        (0.25, 0.40),  # Sedang vertikal
-        (0.40, 0.25),  # Sedang horizontal
-        (0.35, 0.35),  # Persegi (untuk ulat/bercak)
+        (0.2303, 0.2020),
+        (0.2655, 0.3879),
+        (0.5278, 0.2734),
+        (0.2849, 0.6452),
+        (0.9088, 0.2568),
+        (0.2704, 0.9611),
+        (0.6447, 0.6032),  # Persegi (untuk ulat/bercak)
     ]
     # ==================== Training Configuration ====================
     # Optimization
     BATCH_SIZE = 8  # Adjusted for RTX 3060 12GB VRAM
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 5e-5
     WEIGHT_DECAY = 1e-3
-    EPOCHS = 30
+    EPOCHS = 50
     WARMUP_EPOCHS = 3
 
     # Learning rate schedule
