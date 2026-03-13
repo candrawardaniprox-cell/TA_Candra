@@ -48,7 +48,7 @@ class Config:
     BATCH_SIZE = 8  # Adjusted for RTX 3060 12GB VRAM
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-3
-    EPOCHS = 150
+    EPOCHS = 250
     WARMUP_EPOCHS = 3
 
     # Learning rate schedule
@@ -64,14 +64,14 @@ class Config:
 
     # ==================== Loss Configuration ====================
     # Loss weights
-    LAMBDA_OBJ = 1.0  # Objectness loss weight
+    LAMBDA_OBJ = 5.0  # Objectness loss weight
     LAMBDA_NOOBJ = 0.5  # No-object loss weight
-    LAMBDA_BBOX = 5.0  # Bounding box loss weight
-    LAMBDA_CLASS = 1.0  # Classification loss weight
+    LAMBDA_BBOX = 2.0  # Bounding box loss weight
+    LAMBDA_CLASS = 3.0  # Classification loss weight
 
     # Loss types
     BBOX_LOSS_TYPE = "giou"  # Options: "mse", "giou", "ciou"
-    USE_FOCAL_LOSS = True  # Use focal loss for classification
+    USE_FOCAL_LOSS = False  # Use focal loss for classification
     FOCAL_ALPHA = 0.25
     FOCAL_GAMMA = 2.0
 

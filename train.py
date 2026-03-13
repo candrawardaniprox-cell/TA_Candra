@@ -433,12 +433,22 @@ def train(args):
         focal_gamma=Config.FOCAL_GAMMA
     )
 
-    # Create optimizer
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=Config.LEARNING_RATE,
-        weight_decay=Config.WEIGHT_DECAY
-    )
+    # Create optimizer dengan Differential Learning Rate
+    backbone_params = []
+    other_params = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'backbone' in name:
+            backbone_params.append(param)
+        else:
+            other_params.append(param)
+
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': Config.LEARNING_RATE * 0.1}, # Backbone dilatih 10x lebih lambat (Sangat Penting!)
+        {'params': other_params, 'lr': Config.LEARNING_RATE}           # Transformer dilatih dengan kecepatan normal
+    ], weight_decay=Config.WEIGHT_DECAY)
 
     # Create scheduler
     if Config.LR_SCHEDULER == "cosine":
