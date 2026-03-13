@@ -196,6 +196,7 @@ class DetectionLoss(nn.Module):
             return (
                 torch.zeros(N, device=pred_boxes.device),
                 torch.zeros(N, 4, device=pred_boxes.device),
+                torch.zeros(N, dtype=torch.long, device=pred_boxes.device),
                 torch.zeros(N, dtype=torch.long, device=pred_boxes.device)
             )
 

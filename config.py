@@ -14,7 +14,7 @@ class Config:
 
     # ==================== Model Architecture ====================
     # Input/Output specifications
-    IMAGE_SIZE = 512  # Input image resolution (320x320)
+    IMAGE_SIZE = 256  # Input image resolution (320x320)
     NUM_CLASSES = 4  # Number of object classes (COCO default)
 
     # CNN Backbone settings
@@ -25,7 +25,7 @@ class Config:
     # Transformer settings
     TRANSFORMER_DIM = 256  # Must match last BACKBONE_CHANNELS value
     TRANSFORMER_HEADS = 8  # Number of attention heads
-    TRANSFORMER_LAYERS = 4  # Number of transformer encoder layers
+    TRANSFORMER_LAYERS = 2  # Number of transformer encoder layers
     TRANSFORMER_FF_DIM = 1024  # Feed-forward network dimension
     TRANSFORMER_DROPOUT = 0.1
 
@@ -45,7 +45,7 @@ class Config:
     ]
     # ==================== Training Configuration ====================
     # Optimization
-    BATCH_SIZE = 8  # Adjusted for RTX 3060 12GB VRAM
+    BATCH_SIZE = 4  # Adjusted for RTX 3060 12GB VRAM
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-3
     EPOCHS = 250
@@ -60,7 +60,7 @@ class Config:
     GRAD_CLIP_NORM = 1.0
 
     # Mixed precision training
-    USE_AMP = False  # Automatic Mixed Precision for RTX 3060
+    USE_AMP = True  # Automatic Mixed Precision for RTX 3060
 
     # ==================== Loss Configuration ====================
     # Loss weights
@@ -89,11 +89,11 @@ class Config:
     DATA_ROOT = Path("data") / "coco copy"
     TRAIN_IMAGES = DATA_ROOT / "train2017"  
     VAL_IMAGES = DATA_ROOT / "val2017"
-    TRAIN_ANNOTATIONS = DATA_ROOT / "annotations_coco" / "instances_train2017.json"
-    VAL_ANNOTATIONS = DATA_ROOT / "annotations_coco" / "instances_val2017.json"
+    TRAIN_ANNOTATIONS = DATA_ROOT / "annotations_coco" / "instances_train2017.json.json"
+    VAL_ANNOTATIONS = DATA_ROOT / "annotations_coco" / "instances_val2017.json.json"
 
     # Data loading
-    NUM_WORKERS = 4  # Number of dataloader workers
+    NUM_WORKERS = 8  # Number of dataloader workers
     PIN_MEMORY = True  # Pin memory for faster GPU transfer
     PERSISTENT_WORKERS = True  # Keep workers alive between epochs
 
@@ -123,7 +123,7 @@ class Config:
 
     # ==================== Evaluation Configuration ====================
     EVAL_IOU_THRESHOLDS = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
-    EVAL_FREQUENCY = 1  # Evaluate every N epochs
+    EVAL_FREQUENCY = 5  # Evaluate every N epochs
 
     # ==================== Device Configuration ====================
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

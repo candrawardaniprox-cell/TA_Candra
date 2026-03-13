@@ -476,6 +476,12 @@ def train(args):
     start_epoch = 0
     best_map = 0.0
 
+    # === TAMBAHKAN KODE INI ===
+    history_train_loss = []
+    history_val_loss = []
+    history_map = []
+    # ==========================
+
     if args.resume:
         logger.info(f"Resuming from checkpoint: {args.resume}")
         start_epoch, metrics = load_checkpoint(args.resume, model, optimizer, scheduler)
@@ -494,6 +500,9 @@ def train(args):
             model, train_loader, criterion, optimizer, scaler,
             device, epoch, logger, writer, Config.LOG_FREQUENCY
         )
+        # === TAMBAHKAN KODE INI ===
+        history_train_loss.append(train_losses['total_loss'])
+        # ==========================
 
         logger.info(
             f"Train - Loss: {train_losses['total_loss']:.4f}, "
@@ -507,6 +516,11 @@ def train(args):
             val_metrics = validate(
                 model, val_loader, criterion, device, epoch, logger, writer
             )
+
+            # === TAMBAHKAN KODE INI ===
+            history_val_loss.append(val_metrics['val_loss'])
+            history_map.append(val_metrics.get('mAP@0.50', 0.0))
+            # ==========================
 
             logger.info(
                 f"Val - Loss: {val_metrics['val_loss']:.4f}, "
@@ -533,6 +547,46 @@ def train(args):
 
         # Step scheduler
         scheduler.step()
+# === TAMBAHKAN KODE INI UNTUK MEMBUAT GRAFIK TUGAS AKHIR ===
+    import matplotlib.pyplot as plt
+    import json
+    
+    # Simpan data ke JSON untuk cadangan plot ulang jika diperlukan
+    with open('training_history.json', 'w') as f:
+        json.dump({
+            'train_loss': history_train_loss,
+            'val_loss': history_val_loss,
+            'map': history_map
+        }, f)
+
+    epochs_range = range(start_epoch + 1, Config.EPOCHS + 1)
+    
+    # 1. Plot Grafik Loss
+    plt.figure(figsize=(10, 5))
+    plt.plot(epochs_range, history_train_loss, label='Train Loss', color='blue', linewidth=2)
+    plt.plot(epochs_range, history_val_loss, label='Validation Loss', color='red', linewidth=2)
+    plt.title('Training and Validation Loss', fontsize=14)
+    plt.xlabel('Epochs', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.legend(fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.savefig('loss_graph.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 2. Plot Grafik mAP
+    plt.figure(figsize=(10, 5))
+    plt.plot(epochs_range, history_map, label='mAP@0.50', color='green', linewidth=2)
+    plt.title('Validation mAP@0.50', fontsize=14)
+    plt.xlabel('Epochs', fontsize=12)
+    plt.ylabel('mAP', fontsize=12)
+    plt.legend(fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.savefig('map_graph.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    logger.info("Grafik berhasil disimpan sebagai 'loss_graph.png' dan 'map_graph.png'")
+    # ==========================================================
+
 
     logger.info("\nTraining completed!")
     logger.info(f"Best mAP@0.5: {best_map:.4f}")

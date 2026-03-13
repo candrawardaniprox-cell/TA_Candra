@@ -4,23 +4,26 @@ from pathlib import Path
 def fix_coco_json(input_path, output_path):
     print(f"Memproses {input_path}...")
     
-    with open(input_path, 'r') as f:
-        data = json.load(f)
+    try:
+        with open(input_path, 'r') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"GAGAL: File tidak ditemukan di {input_path}")
+        return
         
-    # Asumsi awal ID di JSON Anda:
-    # 0 = sehat
-    # 1 = slabung
-    # 2 = sehat (duplikat)
-    # 3 = moler
-    # 4 = ulat_grayak
-    # (Jika urutan aslinya berbeda, silakan sesuaikan angka di sebelah kiri kamus ini)
+    # Mapping berdasarkan isi file JSON asli dari Roboflow Anda:
+    # 0 = sehat        -> Target 0 (sehat)
+    # 1 = moler        -> Target 2 (moler)
+    # 2 = sehat        -> Target 0 (sehat)
+    # 3 = slabung      -> Target 1 (slabung)
+    # 4 = ulat_grayak  -> Target 3 (ulat_grayak)
     
     id_mapping = {
-        0: 0,  # sehat tetap 0
-        1: 1,  # slabung tetap 1
-        2: 0,  # sehat (duplikat) diubah menjadi 0
-        3: 2,  # moler digeser menjadi 2
-        4: 3   # ulat_grayak digeser menjadi 3
+        0: 0, 
+        1: 2, # Moler aslinya 1, kita geser ke 2
+        2: 0, # Sehat duplikat (2) kita jadikan 0
+        3: 1, # Slabung aslinya 3, kita geser ke 1
+        4: 3  # Ulat grayak aslinya 4, kita geser ke 3
     }
     
     # 1. Perbaiki category_id di semua kotak anotasi
@@ -47,10 +50,9 @@ def fix_coco_json(input_path, output_path):
     print(f"Selesai! Berhasil menggabungkan {count_fixed} anotasi 'sehat' duplikat.")
     print("-" * 50)
 
-# Jalankan perbaikan untuk data train dan val
-# PERHATIAN: Pastikan path ini sesuai dengan lokasi file JSON Anda
-train_json = "data/coco copy/annotations_coco/instances_train2017.json"
-val_json = "data/coco copy/annotations_coco/instances_val2017.json"
+# Jalankan perbaikan menggunakan nama file .json.json yang benar
+train_json = "data/coco copy/annotations_coco/instances_train2017.json.json"
+val_json = "data/coco copy/annotations_coco/instances_val2017.json.json"
 
 fix_coco_json(train_json, train_json)
 fix_coco_json(val_json, val_json)
