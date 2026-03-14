@@ -14,7 +14,7 @@ class Config:
 
     # ==================== Model Architecture ====================
     # Input/Output specifications
-    IMAGE_SIZE = 256  # Input image resolution (320x320)
+    IMAGE_SIZE = 512  # Input image resolution (320x320)
     NUM_CLASSES = 4  # Number of object classes (COCO default)
 
     # CNN Backbone settings
@@ -25,7 +25,7 @@ class Config:
     # Transformer settings
     TRANSFORMER_DIM = 256  # Must match last BACKBONE_CHANNELS value
     TRANSFORMER_HEADS = 8  # Number of attention heads
-    TRANSFORMER_LAYERS = 2  # Number of transformer encoder layers
+    TRANSFORMER_LAYERS = 4  # Number of transformer encoder layers
     TRANSFORMER_FF_DIM = 1024  # Feed-forward network dimension
     TRANSFORMER_DROPOUT = 0.1
 
