@@ -19,8 +19,9 @@ import argparse
 import logging
 from tqdm import tqdm
 import json
+import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # TAMBAHKAN BARIS INI (Mode tanpa GUI)
+matplotlib.use('Agg')  # Mode tanpa GUI
 import matplotlib.pyplot as plt
 from datetime import datetime
 
@@ -28,6 +29,8 @@ from config import Config
 from models import HybridDetector
 from data import ObjectDetectionDataset, get_train_transforms, get_val_transforms, create_dataloaders
 from utils import DetectionLoss, calculate_map, batched_nms
+# Import fungsi perhitungan Precision dan Recall
+from utils.metrics import calculate_precision_recall
 
 
 def setup_logging(log_dir: Path) -> logging.Logger:
@@ -51,6 +54,104 @@ def setup_logging(log_dir: Path) -> logging.Logger:
     logger.addHandler(ch)
 
     return logger
+
+
+def generate_confusion_matrix(predictions, targets, num_classes, save_path):
+    """
+    Menghasilkan dan menyimpan Confusion Matrix untuk Object Detection.
+    """
+    cm = np.zeros((num_classes + 1, num_classes + 1), dtype=np.int32)
+    iou_thresh = 0.5
+    
+    for pred, target in zip(predictions, targets):
+        p_boxes = pred['boxes'].cpu().numpy()
+        p_classes = pred['classes'].cpu().numpy()
+        p_scores = pred['scores'].cpu().numpy()
+        
+        t_boxes = target['boxes'].cpu().numpy()
+        t_labels = target['labels'].cpu().numpy()
+        
+        if len(t_boxes) == 0 and len(p_boxes) == 0:
+            continue
+            
+        if len(t_boxes) == 0:
+            for pc in p_classes:
+                cm[num_classes][int(pc)] += 1
+            continue
+            
+        if len(p_boxes) == 0:
+            for tc in t_labels:
+                cm[int(tc)][num_classes] += 1
+            continue
+            
+        def to_corners(boxes):
+            x1 = boxes[:, 0] - boxes[:, 2] / 2
+            y1 = boxes[:, 1] - boxes[:, 3] / 2
+            x2 = boxes[:, 0] + boxes[:, 2] / 2
+            y2 = boxes[:, 1] + boxes[:, 3] / 2
+            return np.stack([x1, y1, x2, y2], axis=1)
+        
+        pb_c = to_corners(p_boxes)
+        tb_c = to_corners(t_boxes)
+        
+        ious = np.zeros((len(pb_c), len(tb_c)))
+        for i, pb in enumerate(pb_c):
+            for j, tb in enumerate(tb_c):
+                ix1, iy1 = max(pb[0], tb[0]), max(pb[1], tb[1])
+                ix2, iy2 = min(pb[2], tb[2]), min(pb[3], tb[3])
+                inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                uni = (pb[2]-pb[0])*(pb[3]-pb[1]) + (tb[2]-tb[0])*(tb[3]-tb[1]) - inter
+                ious[i, j] = inter / (uni + 1e-6)
+                
+        matched_targets = set()
+        sorted_idx = np.argsort(-p_scores)
+        
+        for p_idx in sorted_idx:
+            best_iou = 0
+            best_t_idx = -1
+            for t_idx in range(len(t_boxes)):
+                if t_idx in matched_targets:
+                    continue
+                if ious[p_idx, t_idx] > best_iou:
+                    best_iou = ious[p_idx, t_idx]
+                    best_t_idx = t_idx
+                    
+            p_cls = int(p_classes[p_idx])
+            if best_iou >= iou_thresh:
+                t_cls = int(t_labels[best_t_idx])
+                cm[t_cls][p_cls] += 1
+                matched_targets.add(best_t_idx)
+            else:
+                cm[num_classes][p_cls] += 1
+                
+        for t_idx in range(len(t_boxes)):
+            if t_idx not in matched_targets:
+                t_cls = int(t_labels[t_idx])
+                cm[t_cls][num_classes] += 1
+                
+    plt.figure(figsize=(9, 7))
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title('Confusion Matrix @ IoU 0.50', fontsize=14)
+    plt.colorbar()
+    
+    classes = [f'Class {i}' for i in range(num_classes)] + ['Background']
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=45, ha='right', fontsize=10)
+    plt.yticks(tick_marks, classes, fontsize=10)
+    
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(cm[i, j], 'd'),
+                     horizontalalignment="center",
+                     color="white" if cm[i, j] > thresh else "black",
+                     fontsize=11, fontweight='bold')
+                     
+    plt.ylabel('True Label (Ground Truth)', fontsize=12)
+    plt.xlabel('Predicted Label', fontsize=12)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
 
 
 def train_one_epoch(
@@ -117,7 +218,7 @@ def train_one_epoch(
 @torch.no_grad()
 def validate(
     model: nn.Module, dataloader, criterion, device, epoch: int, logger, writer=None
-) -> dict:
+) -> tuple:
     model.eval()
 
     total_loss = 0.0
@@ -157,14 +258,15 @@ def validate(
     avg_loss = total_loss / num_batches
 
     if len(all_predictions) > 0:
+        iou_thresholds = np.arange(0.5, 1.0, 0.05).tolist()
         map_metrics = calculate_map(
             all_predictions[:min(len(all_predictions), 500)],
             all_targets[:min(len(all_targets), 500)],
             num_classes=Config.NUM_CLASSES,
-            iou_thresholds=[0.5]
+            iou_thresholds=iou_thresholds
         )
     else:
-        map_metrics = {'mAP@0.50': 0.0}
+        map_metrics = {'mAP@0.50': 0.0, 'mAP@[0.5:0.95]': 0.0}
 
     metrics = {
         'val_loss': avg_loss,
@@ -176,7 +278,7 @@ def validate(
         for key, value in map_metrics.items():
             writer.add_scalar(f'Val/{key}', value, epoch)
 
-    return metrics
+    return metrics, all_predictions, all_targets
 
 
 def save_checkpoint(
@@ -305,34 +407,42 @@ def train(args):
 
     start_epoch = 0
     best_map = 0.0
+    
+    # === Inisialisasi Riwayat Grafik ===
     history_train_loss = []
     history_val_loss = []
     history_map = []
+    history_map_strict = []
+    history_train_bbox = []
+    history_train_cls = []
+    history_train_obj = []
+    history_precision = [] # BARU
+    history_recall = []    # BARU
 
     if args.resume:
         logger.info(f"Resuming from checkpoint: {args.resume}")
         start_epoch, metrics = load_checkpoint(args.resume, model, optimizer, scheduler)
         best_map = metrics.get('mAP@0.50', 0.0)
 
-        # === TAMBAHKAN LOGIKA INI UNTUK MENYAMBUNG GRAFIK ===
         history_file = Path('training_history.json')
         if history_file.exists():
             try:
                 with open(history_file, 'r') as f:
                     past_history = json.load(f)
                 
-                # Potong riwayat menyesuaikan start_epoch agar grafik tidak tumpang tindih
-                # (Berguna jika misal crash di epoch 9, tapi resume dari model epoch 6)
                 history_train_loss = past_history.get('train_loss', [])[:start_epoch]
-                
-                # Karena Anda mengevaluasi setiap epoch (EVAL_FREQUENCY = 1), potongannya sama
                 history_val_loss = past_history.get('val_loss', [])[:start_epoch]
                 history_map = past_history.get('map', [])[:start_epoch]
+                history_map_strict = past_history.get('map_strict', [])[:start_epoch]
+                history_train_bbox = past_history.get('train_bbox', [])[:start_epoch]
+                history_train_cls = past_history.get('train_cls', [])[:start_epoch]
+                history_train_obj = past_history.get('train_obj', [])[:start_epoch]
+                history_precision = past_history.get('precision', [])[:start_epoch] # BARU
+                history_recall = past_history.get('recall', [])[:start_epoch]       # BARU
                 
                 logger.info(f"Berhasil memuat riwayat grafik untuk {len(history_train_loss)} epoch sebelumnya.")
             except Exception as e:
                 logger.warning(f"Gagal memuat riwayat grafik: {e}")
-        # ====================================================
 
     logger.info("Starting training...")
 
@@ -340,28 +450,58 @@ def train(args):
         logger.info(f"\nEpoch {epoch + 1}/{Config.EPOCHS}")
         logger.info(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
 
+        # Train 1 Epoch
         train_losses = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler,
             device, epoch, logger, writer, Config.LOG_FREQUENCY
         )
+        
         history_train_loss.append(train_losses['total_loss'])
+        history_train_bbox.append(train_losses['bbox_loss'])
+        history_train_cls.append(train_losses['class_loss'])
+        history_train_obj.append(train_losses['obj_loss'])
 
         logger.info(f"Train - Loss: {train_losses['total_loss']:.4f}, Obj: {train_losses['obj_loss']:.4f}, BBox: {train_losses['bbox_loss']:.4f}, Class: {train_losses['class_loss']:.4f}")
 
+        # Evaluasi
         if (epoch + 1) % Config.EVAL_FREQUENCY == 0:
-            val_metrics = validate(model, val_loader, criterion, device, epoch, logger, writer)
+            val_metrics, val_preds, val_targets = validate(model, val_loader, criterion, device, epoch, logger, writer)
+
+            # === HITUNG PRECISION DAN RECALL ===
+            precisions, recalls = calculate_precision_recall(val_preds, val_targets, iou_threshold=0.5, num_classes=Config.NUM_CLASSES)
+            mean_precision = np.mean(precisions) if len(precisions) > 0 else 0.0
+            mean_recall = np.mean(recalls) if len(recalls) > 0 else 0.0
+            
+            history_precision.append(mean_precision)
+            history_recall.append(mean_recall)
+            # ===================================
 
             history_val_loss.append(val_metrics['val_loss'])
             history_map.append(val_metrics.get('mAP@0.50', 0.0))
+            history_map_strict.append(val_metrics.get('mAP@[0.5:0.95]', 0.0))
 
-            logger.info(f"Val - Loss: {val_metrics['val_loss']:.4f}, mAP@0.5: {val_metrics.get('mAP@0.50', 0.0):.4f}")
+            logger.info(f"Val - Loss: {val_metrics['val_loss']:.4f}, mAP@0.50: {val_metrics.get('mAP@0.50', 0.0):.4f}")
+            logger.info(f"Val - Precision: {mean_precision:.4f}, Recall: {mean_recall:.4f}")
 
+            # Simpan Data JSON
             with open('training_history.json', 'w') as f:
-                json.dump({'train_loss': history_train_loss, 'val_loss': history_val_loss, 'map': history_map}, f)
+                json.dump({
+                    'train_loss': history_train_loss, 
+                    'val_loss': history_val_loss, 
+                    'map': history_map,
+                    'map_strict': history_map_strict,
+                    'train_bbox': history_train_bbox,
+                    'train_cls': history_train_cls,
+                    'train_obj': history_train_obj,
+                    'precision': history_precision, # BARU
+                    'recall': history_recall        # BARU
+                }, f)
 
+            # Setup Sumbu X
             x_train = list(range(start_epoch + 1, start_epoch + 1 + len(history_train_loss)))
             x_val = [start_epoch + i for i in range(1, len(history_train_loss) + 1) if i % Config.EVAL_FREQUENCY == 0]
 
+            # 1. Plot Loss
             plt.figure(figsize=(10, 5))
             plt.plot(x_train, history_train_loss, label='Train Loss', color='blue', linewidth=2)
             if len(x_val) == len(history_val_loss):
@@ -374,10 +514,12 @@ def train(args):
             plt.savefig('loss_graph.png', dpi=300, bbox_inches='tight')
             plt.close()
 
+            # 2. Plot mAP
             if len(x_val) == len(history_map):
                 plt.figure(figsize=(10, 5))
                 plt.plot(x_val, history_map, label='mAP@0.50', color='green', marker='s', linewidth=2)
-                plt.title('Validation mAP@0.50', fontsize=14)
+                plt.plot(x_val, history_map_strict, label='mAP@[0.5:0.95]', color='teal', marker='^', linewidth=2)
+                plt.title('Validation Mean Average Precision (mAP)', fontsize=14)
                 plt.xlabel('Epochs', fontsize=12)
                 plt.ylabel('mAP', fontsize=12)
                 plt.legend(fontsize=12)
@@ -385,8 +527,61 @@ def train(args):
                 plt.savefig('map_graph.png', dpi=300, bbox_inches='tight')
                 plt.close()
 
-            logger.info("--> Grafik update tersimpan ke 'loss_graph.png' dan 'map_graph.png'")
+            # 3. Plot PRECISION DAN RECALL (BARU)
+            if len(x_val) == len(history_precision):
+                plt.figure(figsize=(10, 5))
+                plt.plot(x_val, history_precision, label='Precision', color='blue', marker='o', linewidth=2)
+                plt.plot(x_val, history_recall, label='Recall', color='darkorange', marker='D', linewidth=2)
+                plt.title('Validation Precision & Recall @ IoU 0.50', fontsize=14)
+                plt.xlabel('Epochs', fontsize=12)
+                plt.ylabel('Score', fontsize=12)
+                plt.ylim(0, 1.05) # Memastikan sumbu Y dari 0 sampai 1
+                plt.legend(fontsize=12)
+                plt.grid(True, linestyle='--', alpha=0.7)
+                plt.savefig('precision_recall_graph.png', dpi=300, bbox_inches='tight')
+                plt.close()
+                
+            # 4. Plot BBox Loss
+            plt.figure(figsize=(10, 5))
+            plt.plot(x_train, history_train_bbox, label='Train BBox Loss', color='orange', linewidth=2)
+            plt.title('Training Bounding Box Loss', fontsize=14)
+            plt.xlabel('Epochs', fontsize=12)
+            plt.ylabel('Loss', fontsize=12)
+            plt.legend(fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.savefig('loss_bbox_graph.png', dpi=300, bbox_inches='tight')
+            plt.close()
 
+            # 5. Plot Class Loss
+            plt.figure(figsize=(10, 5))
+            plt.plot(x_train, history_train_cls, label='Train Class Loss', color='purple', linewidth=2)
+            plt.title('Training Classification Loss', fontsize=14)
+            plt.xlabel('Epochs', fontsize=12)
+            plt.ylabel('Loss', fontsize=12)
+            plt.legend(fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.savefig('loss_class_graph.png', dpi=300, bbox_inches='tight')
+            plt.close()
+
+            # 6. Plot Obj Loss
+            plt.figure(figsize=(10, 5))
+            plt.plot(x_train, history_train_obj, label='Train Objectness Loss', color='brown', linewidth=2)
+            plt.title('Training Objectness Loss', fontsize=14)
+            plt.xlabel('Epochs', fontsize=12)
+            plt.ylabel('Loss', fontsize=12)
+            plt.legend(fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.savefig('loss_obj_graph.png', dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            # 7. Confusion Matrix
+            try:
+                generate_confusion_matrix(val_preds, val_targets, Config.NUM_CLASSES, 'confusion_matrix.png')
+                logger.info("--> 7 Grafik Evaluasi Utama berhasil diperbarui!")
+            except Exception as e:
+                logger.error(f"Gagal membuat Confusion Matrix: {e}")
+
+            # Menyimpan Model Terbaik
             current_map = val_metrics.get('mAP@0.50', 0.0)
             if current_map > best_map:
                 best_map = current_map
