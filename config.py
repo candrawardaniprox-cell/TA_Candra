@@ -27,7 +27,7 @@ class Config:
     TRANSFORMER_HEADS = 8  # Number of attention heads
     TRANSFORMER_LAYERS = 4  # Number of transformer encoder layers
     TRANSFORMER_FF_DIM = 1024  # Feed-forward network dimension
-    TRANSFORMER_DROPOUT = 0.1
+    TRANSFORMER_DROPOUT = 0.3
 
     # Detection Head settings
     GRID_SIZE = 32  # Output grid size (IMAGE_SIZE / 16 = 320 / 16 = 20)
@@ -35,19 +35,19 @@ class Config:
 
     # Anchor boxes (width, height) relative to grid cell - optimized for COCO
     ANCHOR_BOXES = [
-        (0.2303, 0.2020),
-        (0.2655, 0.3879),
-        (0.5278, 0.2734),
-        (0.2849, 0.6452),
-        (0.9088, 0.2568),
-        (0.2704, 0.9611),
-        (0.6447, 0.6032),  # Persegi (untuk ulat/bercak)
+        (0.2226, 0.2088),
+        (0.3261, 0.4026),
+        (0.5987, 0.2753),
+        (0.2769, 0.6696),
+        (0.9525, 0.2563),
+        (0.2533, 0.9730),
+        (0.6706, 0.6809),  # Persegi (untuk ulat/bercak)
     ]
     # ==================== Training Configuration ====================
     # Optimization
     BATCH_SIZE = 4  # Adjusted for RTX 3060 12GB VRAM
     LEARNING_RATE = 1e-4
-    WEIGHT_DECAY = 1e-3
+    WEIGHT_DECAY = 1e-2
     EPOCHS = 250
     WARMUP_EPOCHS = 3
 
@@ -123,7 +123,7 @@ class Config:
 
     # ==================== Evaluation Configuration ====================
     EVAL_IOU_THRESHOLDS = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
-    EVAL_FREQUENCY = 5  # Evaluate every N epochs
+    EVAL_FREQUENCY = 1  # Evaluate every N epochs
 
     # ==================== Device Configuration ====================
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

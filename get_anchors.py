@@ -52,6 +52,6 @@ def calculate_anchors(json_path, num_anchors=7, image_size=512):
 
 if __name__ == '__main__':
     # Ganti path ini jika lokasi file JSON train Anda berbeda
-    JSON_FILE = 'data/coco copy/annotations_coco/instances_train2017.json'
+    JSON_FILE = 'data/coco copy/annotations_coco/instances_train2017.json.json'
     
     calculate_anchors(JSON_FILE, num_anchors=7, image_size=512)
