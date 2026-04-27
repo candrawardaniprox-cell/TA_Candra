@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 matplotlib.use('Agg')
 
+from notification import play_alert_sequence
 from config import Config
 from data import (
     ObjectDetectionDataset,
@@ -1985,6 +1986,9 @@ def train(args):
         logger.info("\n  Stage-2 classifier dilewati karena --detector-only aktif.")
     else:
         logger.info("\n  Stage-2 classifier dilewati karena Config.ENABLE_STAGE2_CLASSIFIER=False.")
+
+    # Putar alarm notifikasi training selesai
+    play_alert_sequence()
 
 
 if __name__ == "__main__":

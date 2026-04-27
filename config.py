@@ -80,7 +80,7 @@ class Config:
 
     # ==================== Training ====================
     BATCH_SIZE    = 2
-    LEARNING_RATE = 1e-5
+    LEARNING_RATE = 5e-5
     WEIGHT_DECAY  = 1e-2
     EPOCHS        = 50
     WARMUP_EPOCHS = 5
@@ -143,7 +143,7 @@ class Config:
     PERSISTENT_WORKERS = True
 
     AUGMENT                   = False
-    AUGMENT_REPEAT_FACTOR     = 2
+    AUGMENT_REPEAT_FACTOR     = 1
     MEDIAN_BLUR_PROB          = 0.2
     MEDIAN_BLUR_LIMIT         = 3
     HORIZONTAL_FLIP_PROB      = 0.5
