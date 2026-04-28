@@ -80,7 +80,7 @@ class Config:
 
     # ==================== Training ====================
     BATCH_SIZE    = 2
-    LEARNING_RATE = 5e-5
+    LEARNING_RATE = 2e-4
     WEIGHT_DECAY  = 1e-2
     EPOCHS        = 50
     WARMUP_EPOCHS = 5
