@@ -38,6 +38,7 @@ from models import HybridDetector
 from utils import AnchorFreeLoss, calculate_map
 from utils.metrics_fixed import (
     calculate_classification_metrics,
+    calculate_multiclass_metrics,
     generate_confusion_matrix,
     generate_detection_confusion_matrix,
 )
@@ -45,13 +46,32 @@ from utils.visualization import draw_bounding_boxes
 from train_classifier import train_classifier as train_stage2_classifier
 
 MAP_IOU_THRESHOLDS = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
-METRIC_ROW_ORDER = [
+SINGLE_METRIC_ROW_ORDER = [
     'Accuracy',
     'Precision',
     'Recall',
     'F1-Score',
     'mAP@0.50',
     'mAP@[0.50:0.95]',
+]
+MULTI_PER_CLASS_ROW_ORDER = [
+    'Accuracy',
+    'Precision',
+    'Recall',
+    'F1-Score',
+    'Specificity',
+    'mAP@0.50',
+    'mAP@[0.50:0.95]',
+]
+MULTI_GLOBAL_METRIC_ORDER = [
+    'Average Accuracy',
+    'Error Rate',
+    'Precision Micro',
+    'Recall Micro',
+    'F1 Micro',
+    'Precision Macro',
+    'Recall Macro',
+    'F1 Macro',
 ]
 
 
@@ -271,14 +291,15 @@ def get_realtime_elapsed(session_start_time: float | None, elapsed_offset: float
     return max(0.0, float(elapsed_offset) + (time.time() - session_start_time))
 
 
-def init_metric_bundle(num_classes):
+def init_metric_bundle(num_classes, metric_rows=None):
+    metric_rows = metric_rows or SINGLE_METRIC_ROW_ORDER
     zeros = [0.0] * num_classes
     return {
         metric_name: {
             'per_class': list(zeros),
             'global': 0.0,
         }
-        for metric_name in METRIC_ROW_ORDER
+        for metric_name in metric_rows
     }
 
 
@@ -323,8 +344,66 @@ def extract_metric_bundle(metrics, num_classes):
     }
 
 
+def extract_multiclass_bundle(metrics, num_classes):
+    map50_per_class = [
+        float(metrics.get(f'AP@0.50_class_{class_id}', 0.0))
+        for class_id in range(num_classes)
+    ]
+    map5095_per_class = []
+    for class_id in range(num_classes):
+        ap_values = [
+            float(metrics.get(f'AP@{thr:.2f}_class_{class_id}', 0.0))
+            for thr in MAP_IOU_THRESHOLDS
+        ]
+        map5095_per_class.append(float(np.mean(ap_values)) if ap_values else 0.0)
+
+    return {
+        'Accuracy': {
+            'per_class': list(metrics.get('multi_accuracy_per_class', np.zeros(num_classes))[:num_classes]),
+            'global': float(metrics.get('average_accuracy', 0.0)),
+        },
+        'Precision': {
+            'per_class': list(metrics.get('multi_precision_per_class', np.zeros(num_classes))[:num_classes]),
+            'global': float(metrics.get('precision_macro', 0.0)),
+        },
+        'Recall': {
+            'per_class': list(metrics.get('multi_recall_per_class', np.zeros(num_classes))[:num_classes]),
+            'global': float(metrics.get('recall_macro', 0.0)),
+        },
+        'F1-Score': {
+            'per_class': list(metrics.get('multi_f1_per_class', np.zeros(num_classes))[:num_classes]),
+            'global': float(metrics.get('f1_macro', 0.0)),
+        },
+        'Specificity': {
+            'per_class': list(metrics.get('multi_specificity_per_class', np.zeros(num_classes))[:num_classes]),
+            'global': float(metrics.get('specificity_macro', 0.0)),
+        },
+        'mAP@0.50': {
+            'per_class': map50_per_class,
+            'global': float(metrics.get('mAP@0.50', 0.0)),
+        },
+        'mAP@[0.50:0.95]': {
+            'per_class': map5095_per_class,
+            'global': float(metrics.get('mAP@[0.5:0.95]', 0.0)),
+        },
+    }
+
+
+def extract_multiclass_global_metrics(metrics):
+    return {
+        'Average Accuracy': float(metrics.get('average_accuracy', 0.0)),
+        'Error Rate': float(metrics.get('error_rate', 0.0)),
+        'Precision Micro': float(metrics.get('precision_micro', 0.0)),
+        'Recall Micro': float(metrics.get('recall_micro', 0.0)),
+        'F1 Micro': float(metrics.get('f1_micro', 0.0)),
+        'Precision Macro': float(metrics.get('precision_macro', 0.0)),
+        'Recall Macro': float(metrics.get('recall_macro', 0.0)),
+        'F1 Macro': float(metrics.get('f1_macro', 0.0)),
+    }
+
+
 def update_best_metric_bundle(best_bundle, current_bundle):
-    for metric_name in METRIC_ROW_ORDER:
+    for metric_name in best_bundle.keys():
         best_bundle[metric_name]['per_class'] = [
             max(best_value, current_value)
             for best_value, current_value in zip(
@@ -336,6 +415,27 @@ def update_best_metric_bundle(best_bundle, current_bundle):
             best_bundle[metric_name]['global'],
             current_bundle[metric_name]['global'],
         )
+
+
+def init_best_global_metrics():
+    return {
+        'Average Accuracy': 0.0,
+        'Error Rate': float('inf'),
+        'Precision Micro': 0.0,
+        'Recall Micro': 0.0,
+        'F1 Micro': 0.0,
+        'Precision Macro': 0.0,
+        'Recall Macro': 0.0,
+        'F1 Macro': 0.0,
+    }
+
+
+def update_best_global_metrics(best_metrics, current_metrics):
+    for metric_name, value in current_metrics.items():
+        if metric_name == 'Error Rate':
+            best_metrics[metric_name] = min(best_metrics.get(metric_name, float('inf')), value)
+        else:
+            best_metrics[metric_name] = max(best_metrics.get(metric_name, 0.0), value)
 
 
 def _table_border(label_width, value_width, num_value_cols, fill='-'):
@@ -366,7 +466,7 @@ def log_metric_table(logger, title, class_names, metric_bundle):
     logger.info(top)
     logger.info(header)
     logger.info(mid)
-    for metric_name in METRIC_ROW_ORDER:
+    for metric_name in metric_bundle.keys():
         logger.info(
             _table_row(
                 label_width,
@@ -377,6 +477,33 @@ def log_metric_table(logger, title, class_names, metric_bundle):
             )
         )
     logger.info(top)
+
+
+def log_global_metric_table(logger, title, metrics):
+    label_width = max(18, max(len(name) for name in metrics.keys()))
+    value_width = 12
+    top = "  +" + "=" * (label_width + 2) + "+" + "=" * (value_width + 2) + "+"
+    mid = "  +" + "-" * (label_width + 2) + "+" + "-" * (value_width + 2) + "+"
+
+    logger.info(top)
+    logger.info(f"  | {title:^{label_width + value_width + 5}} |")
+    logger.info(top)
+    logger.info(f"  | {'METRIK':<{label_width}} | {'GLOBAL':>{value_width}} |")
+    logger.info(mid)
+    for metric_name, value in metrics.items():
+        display_value = float(value)
+        if metric_name == 'Error Rate' and not np.isfinite(display_value):
+            display_value = 0.0
+        logger.info(f"  | {metric_name:<{label_width}} | {display_value:>{value_width}.4f} |")
+    logger.info(top)
+
+
+def ensure_metric_graph_dirs():
+    single_dir = Config.GRAPHS_DIR / 'single_label'
+    multi_dir = Config.GRAPHS_DIR / 'multi_class'
+    single_dir.mkdir(parents=True, exist_ok=True)
+    multi_dir.mkdir(parents=True, exist_ok=True)
+    return single_dir, multi_dir
 
 
 def count_bbox_per_class(dataset, num_classes):
@@ -447,7 +574,7 @@ def print_model_config(logger, model, num_classes, image_size, batch_size, lr, e
     logger.info(f"  Focal Params      : alpha={getattr(Config, 'FOCAL_ALPHA', 0.0)} | gamma={getattr(Config, 'FOCAL_GAMMA', 0.0)}")
     logger.info(f"  IoU Assign        : pos={getattr(Config, 'IOU_THRESHOLD_POS', 0.0)} | neg={getattr(Config, 'IOU_THRESHOLD_NEG', 0.0)}")
     logger.info(f"  Checkpoint Metric : {getattr(Config, 'CHECKPOINT_METRIC', 'mAP@0.50')}")
-    logger.info(f"  Metrics           : Accuracy | Precision | Recall | F1 | mAP@0.50 | mAP@[0.50:0.95]")
+    logger.info(f"  Metrics           : single-label + multi-class | mAP@0.50 | mAP@[0.50:0.95]")
     logger.info(
         f"  Inference Class   : conf={getattr(Config, 'CLASS_CONF_THRESHOLD', getattr(Config, 'CONF_THRESHOLD', 0.0))} | "
         f"nms={getattr(Config, 'CLASS_NMS_IOU_THRESHOLD', getattr(Config, 'NMS_IOU_THRESHOLD', 0.0))} | "
@@ -478,8 +605,11 @@ def print_model_config(logger, model, num_classes, image_size, batch_size, lr, e
     )
     logger.info(
         f"  Backbone Config   : {getattr(Config, 'BACKBONE_NAME', 'unknown')} | "
-        f"pretrained={getattr(Config, 'BACKBONE_PRETRAINED', False)}"
+        f"pretrained={getattr(Config, 'BACKBONE_PRETRAINED', False)} | "
+        f"source={getattr(Config, 'BACKBONE_PRETRAIN_SOURCE', 'imagenet')}"
     )
+    if getattr(Config, 'BACKBONE_CUSTOM_WEIGHTS_PATH', None):
+        logger.info(f"  Backbone Weights  : {getattr(Config, 'BACKBONE_CUSTOM_WEIGHTS_PATH')}")
     logger.info(
         f"  Transformer       : dim={getattr(Config, 'TRANSFORMER_DIM', 0)} | "
         f"heads={getattr(Config, 'TRANSFORMER_HEADS', 0)} | "
@@ -503,9 +633,11 @@ def print_model_config(logger, model, num_classes, image_size, batch_size, lr, e
     logger.info(sep + "\n")
 
 
-def _savefig(filename: str):
+def _savefig(filename: str, output_dir: Path | None = None):
+    output_dir = output_dir or Config.GRAPHS_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
-    plt.savefig(Config.GRAPHS_DIR / filename, dpi=150, bbox_inches='tight')
+    plt.savefig(output_dir / filename, dpi=150, bbox_inches='tight')
     plt.close()
 
 
@@ -526,7 +658,7 @@ def _annotate_best_point(x_values, y_values, mode='max', text='Best Model'):
     x_offset = 10 if best_idx < max(1, len(x_values) // 2) else -46
     y_offset = -16 if best_y > float(np.nanmean(y_array)) else 12
     plt.annotate(
-        text,
+        f"{text}\n{best_y:.4f}",
         xy=(best_x, best_y),
         xytext=(x_offset, y_offset),
         textcoords='offset points',
@@ -544,7 +676,7 @@ def _annotate_best_point(x_values, y_values, mode='max', text='Best Model'):
     )
 
 
-def save_single_metric_plot(x_val, y_val, title, ylabel, fname, color, marker, mode='max'):
+def save_single_metric_plot(x_val, y_val, title, ylabel, fname, color, marker, mode='max', output_dir: Path | None = None):
     if not x_val or len(x_val) != len(y_val):
         return
 
@@ -555,7 +687,7 @@ def save_single_metric_plot(x_val, y_val, title, ylabel, fname, color, marker, m
     plt.xlabel('Epoch')
     plt.ylabel(ylabel)
     plt.grid(True, alpha=0.7)
-    _savefig(fname)
+    _savefig(fname, output_dir=output_dir)
 
 
 def build_dense_epoch_series(x_sparse, y_sparse):
@@ -596,6 +728,7 @@ def save_dual_metric_plot(
     mode='max',
     train_sparse_x=None,
     train_sparse_y=None,
+    output_dir: Path | None = None,
 ):
     if (not x_train or len(x_train) != len(y_train)) and (not x_val or len(x_val) != len(y_val)):
         return
@@ -618,7 +751,7 @@ def save_dual_metric_plot(
     plt.ylabel(ylabel)
     plt.legend()
     plt.grid(True, alpha=0.7)
-    _savefig(fname)
+    _savefig(fname, output_dir=output_dir)
 
 
 def annotate_metric_series(series_list):
@@ -630,7 +763,7 @@ def _safe_metric_filename(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ('_', '-') else "_" for ch in name.lower())
 
 
-def save_loss_plot(x_tr, y_tr, x_val, y_val, title, ylabel, fname):
+def save_loss_plot(x_tr, y_tr, x_val, y_val, title, ylabel, fname, output_dir: Path | None = None):
     plt.figure(figsize=(10, 5))
     if x_tr and len(x_tr) == len(y_tr):
         plt.plot(x_tr, y_tr, label='Train', color='royalblue', linewidth=1.5)
@@ -643,7 +776,7 @@ def save_loss_plot(x_tr, y_tr, x_val, y_val, title, ylabel, fname):
     plt.ylabel(ylabel)
     plt.legend()
     plt.grid(True, alpha=0.5)
-    _savefig(fname)
+    _savefig(fname, output_dir=output_dir)
 
 
 def update_all_plots(
@@ -674,6 +807,7 @@ def update_all_plots(
     h_map5095,
     class_names,
     num_classes,
+    output_dir: Path | None = None,
 ):
     x_tr_acc_dense, h_tr_acc_dense = build_dense_epoch_series(x_tr_metrics, h_tr_acc)
     x_tr_prec_dense, h_tr_prec_dense = build_dense_epoch_series(x_tr_metrics, h_tr_prec)
@@ -682,10 +816,10 @@ def update_all_plots(
     x_tr_map50_dense, h_tr_map50_dense = build_dense_epoch_series(x_tr_metrics, h_tr_map50)
     x_tr_map5095_dense, h_tr_map5095_dense = build_dense_epoch_series(x_tr_metrics, h_tr_map5095)
 
-    save_loss_plot(x_tr, h_tr_loss, x_val, h_val_loss, 'Total Loss', 'Loss', 'loss_total.png')
-    save_loss_plot(x_tr, h_tr_bbox, x_val, h_val_bbox, 'BBox Regression Loss', 'Loss', 'loss_bbox.png')
-    save_loss_plot(x_tr, h_tr_cls, x_val, h_val_cls, 'Classification Loss', 'Loss', 'loss_cls.png')
-    save_loss_plot(x_tr, h_tr_obj, x_val, h_val_obj, 'Objectness/Centerness', 'Loss', 'loss_obj.png')
+    save_loss_plot(x_tr, h_tr_loss, x_val, h_val_loss, 'Total Loss', 'Loss', 'loss_total.png', output_dir=output_dir)
+    save_loss_plot(x_tr, h_tr_bbox, x_val, h_val_bbox, 'BBox Regression Loss', 'Loss', 'loss_bbox.png', output_dir=output_dir)
+    save_loss_plot(x_tr, h_tr_cls, x_val, h_val_cls, 'Classification Loss', 'Loss', 'loss_cls.png', output_dir=output_dir)
+    save_loss_plot(x_tr, h_tr_obj, x_val, h_val_obj, 'Objectness/Centerness', 'Loss', 'loss_obj.png', output_dir=output_dir)
 
     if x_val and len(x_val) == len(h_acc):
         plt.figure(figsize=(10, 5))
@@ -716,12 +850,12 @@ def update_all_plots(
         plt.ylabel('Score')
         plt.legend()
         plt.grid(True, alpha=0.7)
-        _savefig('classification_metrics_graph.png')
+        _savefig('classification_metrics_graph.png', output_dir=output_dir)
 
-        save_dual_metric_plot(x_tr_acc_dense, h_tr_acc_dense, x_val, h_acc, 'Train vs Val Accuracy', 'Accuracy', 'accuracy_graph.png', 'green', 'limegreen', 's', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_acc)
-        save_dual_metric_plot(x_tr_prec_dense, h_tr_prec_dense, x_val, h_prec, 'Train vs Val Precision', 'Precision', 'precision_graph.png', 'royalblue', 'cornflowerblue', 'o', 's', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_prec)
-        save_dual_metric_plot(x_tr_rec_dense, h_tr_rec_dense, x_val, h_rec, 'Train vs Val Recall', 'Recall', 'recall_graph.png', 'darkorange', 'orange', 'D', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_rec)
-        save_dual_metric_plot(x_tr_f1_dense, h_tr_f1_dense, x_val, h_f1, 'Train vs Val F1-Score', 'F1-Score', 'f1_graph.png', 'purple', 'mediumpurple', '^', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_f1)
+        save_dual_metric_plot(x_tr_acc_dense, h_tr_acc_dense, x_val, h_acc, 'Train vs Val Accuracy', 'Accuracy', 'accuracy_graph.png', 'green', 'limegreen', 's', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_acc, output_dir=output_dir)
+        save_dual_metric_plot(x_tr_prec_dense, h_tr_prec_dense, x_val, h_prec, 'Train vs Val Precision', 'Precision', 'precision_graph.png', 'royalblue', 'cornflowerblue', 'o', 's', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_prec, output_dir=output_dir)
+        save_dual_metric_plot(x_tr_rec_dense, h_tr_rec_dense, x_val, h_rec, 'Train vs Val Recall', 'Recall', 'recall_graph.png', 'darkorange', 'orange', 'D', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_rec, output_dir=output_dir)
+        save_dual_metric_plot(x_tr_f1_dense, h_tr_f1_dense, x_val, h_f1, 'Train vs Val F1-Score', 'F1-Score', 'f1_graph.png', 'purple', 'mediumpurple', '^', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_f1, output_dir=output_dir)
 
     if x_val and h_acc_cls and len(h_acc_cls) == num_classes and len(x_val) == len(h_acc_cls[0]):
         colors = ['green', 'royalblue', 'darkorange', 'purple', 'teal', 'crimson']
@@ -746,6 +880,7 @@ def update_all_plots(
                 's',
                 train_sparse_x=x_tr_metrics,
                 train_sparse_y=h_tr_acc_cls[c] if h_tr_acc_cls and len(h_tr_acc_cls) > c else [],
+                output_dir=output_dir,
             )
 
     if x_val and len(x_val) == len(h_map50):
@@ -767,10 +902,158 @@ def update_all_plots(
         plt.ylabel('Score')
         plt.legend()
         plt.grid(True, alpha=0.7)
-        _savefig('map_graph.png')
+        _savefig('map_graph.png', output_dir=output_dir)
 
-        save_dual_metric_plot(x_tr_map50_dense, h_tr_map50_dense, x_val, h_map50, 'Train vs Val mAP@0.50', 'mAP@0.50', 'map50_graph.png', 'seagreen', 'mediumseagreen', 's', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_map50)
-        save_dual_metric_plot(x_tr_map5095_dense, h_tr_map5095_dense, x_val, h_map5095, 'Train vs Val mAP@[0.50:0.95]', 'mAP@[0.50:0.95]', 'map5095_graph.png', 'teal', 'turquoise', '^', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_map5095)
+        save_dual_metric_plot(x_tr_map50_dense, h_tr_map50_dense, x_val, h_map50, 'Train vs Val mAP@0.50', 'mAP@0.50', 'map50_graph.png', 'seagreen', 'mediumseagreen', 's', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_map50, output_dir=output_dir)
+        save_dual_metric_plot(x_tr_map5095_dense, h_tr_map5095_dense, x_val, h_map5095, 'Train vs Val mAP@[0.50:0.95]', 'mAP@[0.50:0.95]', 'map5095_graph.png', 'teal', 'turquoise', '^', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_map5095, output_dir=output_dir)
+
+
+def save_multiclass_per_class_plots(
+    x_train,
+    x_val,
+    class_names,
+    train_histories,
+    val_histories,
+    output_dir: Path | None = None,
+):
+    metric_meta = [
+        ('accuracy', 'Accuracy', 'green', 'limegreen'),
+        ('precision', 'Precision', 'royalblue', 'cornflowerblue'),
+        ('recall', 'Recall', 'darkorange', 'orange'),
+        ('f1', 'F1-Score', 'purple', 'mediumpurple'),
+        ('specificity', 'Specificity', 'teal', 'turquoise'),
+    ]
+
+    for metric_key, metric_label, train_color, val_color in metric_meta:
+        train_by_class = train_histories.get(metric_key, [])
+        val_by_class = val_histories.get(metric_key, [])
+        for class_id, class_label in enumerate(class_names):
+            file_label = _safe_metric_filename(class_label)
+            train_series = train_by_class[class_id] if len(train_by_class) > class_id else []
+            val_series = val_by_class[class_id] if len(val_by_class) > class_id else []
+            train_x_dense, train_y_dense = build_dense_epoch_series(x_train, train_series)
+            save_dual_metric_plot(
+                train_x_dense,
+                train_y_dense,
+                x_val,
+                val_series,
+                f'Train vs Val {metric_label} - {class_label}',
+                metric_label,
+                f'{metric_key}_{file_label}.png',
+                train_color,
+                val_color,
+                'o',
+                's',
+                train_sparse_x=x_train,
+                train_sparse_y=train_series,
+                output_dir=output_dir,
+            )
+
+
+def update_multiclass_plots(
+    x_tr,
+    x_val,
+    loss_histories,
+    x_tr_metrics,
+    train_global_hist,
+    val_global_hist,
+    train_class_hist,
+    val_class_hist,
+    h_map50_train,
+    h_map5095_train,
+    h_map50_val,
+    h_map5095_val,
+    class_names,
+    output_dir: Path | None = None,
+):
+    save_loss_plot(x_tr, loss_histories['train_total'], x_val, loss_histories['val_total'], 'Total Loss', 'Loss', 'loss_total.png', output_dir=output_dir)
+    save_loss_plot(x_tr, loss_histories['train_bbox'], x_val, loss_histories['val_bbox'], 'BBox Regression Loss', 'Loss', 'loss_bbox.png', output_dir=output_dir)
+    save_loss_plot(x_tr, loss_histories['train_cls'], x_val, loss_histories['val_cls'], 'Classification Loss', 'Loss', 'loss_cls.png', output_dir=output_dir)
+    save_loss_plot(x_tr, loss_histories['train_obj'], x_val, loss_histories['val_obj'], 'Objectness/Centerness', 'Loss', 'loss_obj.png', output_dir=output_dir)
+
+    x_tr_acc_dense, h_tr_acc_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['avg_acc'])
+    x_tr_prec_macro_dense, h_tr_prec_macro_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['prec_macro'])
+    x_tr_rec_macro_dense, h_tr_rec_macro_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['rec_macro'])
+    x_tr_f1_macro_dense, h_tr_f1_macro_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['f1_macro'])
+    x_tr_prec_micro_dense, h_tr_prec_micro_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['prec_micro'])
+    x_tr_rec_micro_dense, h_tr_rec_micro_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['rec_micro'])
+    x_tr_f1_micro_dense, h_tr_f1_micro_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['f1_micro'])
+    x_tr_err_dense, h_tr_err_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['error_rate'])
+    x_tr_map50_dense, h_tr_map50_dense = build_dense_epoch_series(x_tr_metrics, h_map50_train)
+    x_tr_map5095_dense, h_tr_map5095_dense = build_dense_epoch_series(x_tr_metrics, h_map5095_train)
+
+    if x_val and len(x_val) == len(val_global_hist['avg_acc']):
+        plt.figure(figsize=(10, 5))
+        if x_tr_acc_dense and len(x_tr_acc_dense) == len(h_tr_acc_dense):
+            plot_dense_train_series(x_tr_metrics, train_global_hist['avg_acc'], 'Train Avg Accuracy', 'green', 's')
+        plt.plot(x_val, val_global_hist['avg_acc'], label='Val Avg Accuracy', color='limegreen', marker='s')
+        if x_tr_prec_macro_dense and len(x_tr_prec_macro_dense) == len(h_tr_prec_macro_dense):
+            plot_dense_train_series(x_tr_metrics, train_global_hist['prec_macro'], 'Train Precision Macro', 'royalblue', 'o')
+        plt.plot(x_val, val_global_hist['prec_macro'], label='Val Precision Macro', color='cornflowerblue', marker='o')
+        if x_tr_rec_macro_dense and len(x_tr_rec_macro_dense) == len(h_tr_rec_macro_dense):
+            plot_dense_train_series(x_tr_metrics, train_global_hist['rec_macro'], 'Train Recall Macro', 'darkorange', 'D')
+        plt.plot(x_val, val_global_hist['rec_macro'], label='Val Recall Macro', color='orange', marker='D')
+        if x_tr_f1_macro_dense and len(x_tr_f1_macro_dense) == len(h_tr_f1_macro_dense):
+            plot_dense_train_series(x_tr_metrics, train_global_hist['f1_macro'], 'Train F1 Macro', 'purple', '^')
+        plt.plot(x_val, val_global_hist['f1_macro'], label='Val F1 Macro', color='mediumpurple', marker='^')
+        annotate_metric_series([
+            (x_tr_metrics, train_global_hist['avg_acc'], 'max'),
+            (x_val, val_global_hist['avg_acc'], 'max'),
+            (x_tr_metrics, train_global_hist['prec_macro'], 'max'),
+            (x_val, val_global_hist['prec_macro'], 'max'),
+            (x_tr_metrics, train_global_hist['rec_macro'], 'max'),
+            (x_val, val_global_hist['rec_macro'], 'max'),
+            (x_tr_metrics, train_global_hist['f1_macro'], 'max'),
+            (x_val, val_global_hist['f1_macro'], 'max'),
+        ])
+        plt.title('Train vs Val Multi-Class Macro Metrics')
+        plt.xlabel('Epoch')
+        plt.ylabel('Score')
+        plt.legend()
+        plt.grid(True, alpha=0.7)
+        _savefig('classification_metrics_graph.png', output_dir=output_dir)
+
+        save_dual_metric_plot(x_tr_acc_dense, h_tr_acc_dense, x_val, val_global_hist['avg_acc'], 'Train vs Val Average Accuracy', 'Average Accuracy', 'accuracy_graph.png', 'green', 'limegreen', 's', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=train_global_hist['avg_acc'], output_dir=output_dir)
+        save_dual_metric_plot(x_tr_prec_macro_dense, h_tr_prec_macro_dense, x_val, val_global_hist['prec_macro'], 'Train vs Val Precision Macro', 'Precision Macro', 'precision_macro_graph.png', 'royalblue', 'cornflowerblue', 'o', 's', train_sparse_x=x_tr_metrics, train_sparse_y=train_global_hist['prec_macro'], output_dir=output_dir)
+        save_dual_metric_plot(x_tr_rec_macro_dense, h_tr_rec_macro_dense, x_val, val_global_hist['rec_macro'], 'Train vs Val Recall Macro', 'Recall Macro', 'recall_macro_graph.png', 'darkorange', 'orange', 'D', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=train_global_hist['rec_macro'], output_dir=output_dir)
+        save_dual_metric_plot(x_tr_f1_macro_dense, h_tr_f1_macro_dense, x_val, val_global_hist['f1_macro'], 'Train vs Val F1 Macro', 'F1 Macro', 'f1_macro_graph.png', 'purple', 'mediumpurple', '^', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=train_global_hist['f1_macro'], output_dir=output_dir)
+        save_dual_metric_plot(x_tr_prec_micro_dense, h_tr_prec_micro_dense, x_val, val_global_hist['prec_micro'], 'Train vs Val Precision Micro', 'Precision Micro', 'precision_micro_graph.png', 'navy', 'steelblue', 'o', 's', train_sparse_x=x_tr_metrics, train_sparse_y=train_global_hist['prec_micro'], output_dir=output_dir)
+        save_dual_metric_plot(x_tr_rec_micro_dense, h_tr_rec_micro_dense, x_val, val_global_hist['rec_micro'], 'Train vs Val Recall Micro', 'Recall Micro', 'recall_micro_graph.png', 'saddlebrown', 'peru', 'D', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=train_global_hist['rec_micro'], output_dir=output_dir)
+        save_dual_metric_plot(x_tr_f1_micro_dense, h_tr_f1_micro_dense, x_val, val_global_hist['f1_micro'], 'Train vs Val F1 Micro', 'F1 Micro', 'f1_micro_graph.png', 'indigo', 'mediumorchid', '^', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=train_global_hist['f1_micro'], output_dir=output_dir)
+        save_dual_metric_plot(x_tr_err_dense, h_tr_err_dense, x_val, val_global_hist['error_rate'], 'Train vs Val Error Rate', 'Error Rate', 'error_rate_graph.png', 'firebrick', 'lightcoral', 'v', 'o', mode='min', train_sparse_x=x_tr_metrics, train_sparse_y=train_global_hist['error_rate'], output_dir=output_dir)
+
+    save_multiclass_per_class_plots(
+        x_train=x_tr_metrics,
+        x_val=x_val,
+        class_names=class_names,
+        train_histories=train_class_hist,
+        val_histories=val_class_hist,
+        output_dir=output_dir,
+    )
+
+    if x_val and len(x_val) == len(h_map50_val):
+        plt.figure(figsize=(10, 5))
+        if x_tr_map50_dense and len(x_tr_map50_dense) == len(h_tr_map50_dense):
+            plot_dense_train_series(x_tr_metrics, h_map50_train, 'Train mAP@0.50', 'seagreen', 's')
+        plt.plot(x_val, h_map50_val, label='Val mAP@0.50', color='mediumseagreen', marker='s')
+        if x_tr_map5095_dense and len(x_tr_map5095_dense) == len(h_tr_map5095_dense):
+            plot_dense_train_series(x_tr_metrics, h_map5095_train, 'Train mAP@[0.50:0.95]', 'teal', '^')
+        plt.plot(x_val, h_map5095_val, label='Val mAP@[0.50:0.95]', color='turquoise', marker='^')
+        annotate_metric_series([
+            (x_tr_metrics, h_map50_train, 'max'),
+            (x_val, h_map50_val, 'max'),
+            (x_tr_metrics, h_map5095_train, 'max'),
+            (x_val, h_map5095_val, 'max'),
+        ])
+        plt.title('Train vs Val mAP')
+        plt.xlabel('Epoch')
+        plt.ylabel('Score')
+        plt.legend()
+        plt.grid(True, alpha=0.7)
+        _savefig('map_graph.png', output_dir=output_dir)
+
+        save_dual_metric_plot(x_tr_map50_dense, h_tr_map50_dense, x_val, h_map50_val, 'Train vs Val mAP@0.50', 'mAP@0.50', 'map50_graph.png', 'seagreen', 'mediumseagreen', 's', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_map50_train, output_dir=output_dir)
+        save_dual_metric_plot(x_tr_map5095_dense, h_tr_map5095_dense, x_val, h_map5095_val, 'Train vs Val mAP@[0.50:0.95]', 'mAP@[0.50:0.95]', 'map5095_graph.png', 'teal', 'turquoise', '^', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_map5095_train, output_dir=output_dir)
 
 
 def create_comparison_images(images, targets, predictions, epoch, class_names):
@@ -871,14 +1154,51 @@ def log_per_class_metrics_dual(
     logger.info(sep + "\n")
 
 
+def log_multiclass_metrics_dual(
+    logger,
+    epoch,
+    class_names,
+    val_current_bundle,
+    val_best_bundle,
+    val_current_globals,
+    val_best_globals,
+    tr_current_bundle=None,
+    tr_best_bundle=None,
+    tr_current_globals=None,
+    tr_best_globals=None,
+):
+    sep = "=" * 90
+
+    logger.info(sep)
+    logger.info(f"  METRIK MULTI-KELAS  |  Epoch {epoch:03d}")
+    logger.info(sep)
+
+    log_metric_table(logger, "VALIDASI MULTI-KELAS (Epoch Ini)", class_names, val_current_bundle)
+    log_global_metric_table(logger, "VALIDASI MULTI-KELAS (Global)", val_current_globals)
+    log_metric_table(logger, "VALIDASI MULTI-KELAS (Best)", class_names, val_best_bundle)
+    log_global_metric_table(logger, "VALIDASI MULTI-KELAS (Best Global)", val_best_globals)
+
+    if tr_current_bundle is not None and tr_current_globals is not None:
+        log_metric_table(logger, "TRAIN MULTI-KELAS (Epoch Ini)", class_names, tr_current_bundle)
+        log_global_metric_table(logger, "TRAIN MULTI-KELAS (Global)", tr_current_globals)
+        log_metric_table(logger, "TRAIN MULTI-KELAS (Best)", class_names, tr_best_bundle)
+        log_global_metric_table(logger, "TRAIN MULTI-KELAS (Best Global)", tr_best_globals)
+
+    logger.info(sep + "\n")
+
+
 def print_final_summary(
     logger,
     class_names,
     best_val_map50_epoch,
     best_val_acc_epoch,
-    best_val_bundle,
-    best_tr_bundle,
-    test_bundle,
+    best_val_bundle_single,
+    best_tr_bundle_single,
+    best_val_bundle_multi,
+    best_tr_bundle_multi,
+    best_val_multi_globals,
+    best_tr_multi_globals,
+    test_results,
     final_train_loss,
     final_val_loss,
     total_epochs,
@@ -905,30 +1225,44 @@ def print_final_summary(
     logger.info("\n" + sep)
     logger.info("  RINGKASAN AKHIR TRAINING")
     logger.info(sep)
-    logger.info(f"  Best Val mAP@0.50        : {best_val_bundle['mAP@0.50']['global']:.4f}  (Epoch {best_val_map50_epoch})")
-    logger.info(f"  Best Val mAP@[0.50:0.95] : {best_val_bundle['mAP@[0.50:0.95]']['global']:.4f}")
-    logger.info(f"  Best Val Accuracy        : {best_val_bundle['Accuracy']['global']:.4f}  (Epoch {best_val_acc_epoch})")
-    logger.info(f"  Best Val Precision       : {best_val_bundle['Precision']['global']:.4f}")
-    logger.info(f"  Best Val Recall          : {best_val_bundle['Recall']['global']:.4f}")
-    logger.info(f"  Best Val F1-Score        : {best_val_bundle['F1-Score']['global']:.4f}")
+    logger.info(f"  Best Val mAP@0.50        : {best_val_bundle_single['mAP@0.50']['global']:.4f}  (Epoch {best_val_map50_epoch})")
+    logger.info(f"  Best Val mAP@[0.50:0.95] : {best_val_bundle_single['mAP@[0.50:0.95]']['global']:.4f}")
+    logger.info(f"  Best Val Avg Accuracy    : {best_val_multi_globals['Average Accuracy']:.4f}  (Epoch {best_val_acc_epoch})")
+    logger.info(f"  Best Val Prec Macro      : {best_val_multi_globals['Precision Macro']:.4f}")
+    logger.info(f"  Best Val Recall Macro    : {best_val_multi_globals['Recall Macro']:.4f}")
+    logger.info(f"  Best Val F1 Macro        : {best_val_multi_globals['F1 Macro']:.4f}")
     logger.info(sep2)
 
-    log_metric_table(logger, "BEST VALIDASI", class_names, best_val_bundle)
+    log_metric_table(logger, "BEST VALIDASI SINGLE-LABEL", class_names, best_val_bundle_single)
     logger.info(sep2)
 
-    log_metric_table(logger, "BEST TRAIN", class_names, best_tr_bundle)
+    log_metric_table(logger, "BEST TRAIN SINGLE-LABEL", class_names, best_tr_bundle_single)
     logger.info(sep2)
+
+    log_metric_table(logger, "BEST VALIDASI MULTI-KELAS", class_names, best_val_bundle_multi)
+    log_global_metric_table(logger, "BEST VALIDASI MULTI-KELAS (GLOBAL)", best_val_multi_globals)
+    logger.info(sep2)
+
+    log_metric_table(logger, "BEST TRAIN MULTI-KELAS", class_names, best_tr_bundle_multi)
+    log_global_metric_table(logger, "BEST TRAIN MULTI-KELAS (GLOBAL)", best_tr_multi_globals)
+    logger.info(sep2)
+
+    test_single_bundle = test_results['single_bundle']
+    test_multi_bundle = test_results['multi_bundle']
+    test_multi_globals = test_results['multi_globals']
 
     logger.info("  TEST GLOBAL")
     logger.info(
-        f"  Test mAP@0.50={test_bundle['mAP@0.50']['global']:.4f} | "
-        f"mAP@[0.50:0.95]={test_bundle['mAP@[0.50:0.95]']['global']:.4f} | "
-        f"Accuracy={test_bundle['Accuracy']['global']:.4f} | "
-        f"Prec={test_bundle['Precision']['global']:.4f} | "
-        f"Rec={test_bundle['Recall']['global']:.4f} | "
-        f"F1={test_bundle['F1-Score']['global']:.4f}"
+        f"  Test mAP@0.50={test_single_bundle['mAP@0.50']['global']:.4f} | "
+        f"mAP@[0.50:0.95]={test_single_bundle['mAP@[0.50:0.95]']['global']:.4f} | "
+        f"AvgAccMulti={test_multi_globals['Average Accuracy']:.4f} | "
+        f"PrecMacro={test_multi_globals['Precision Macro']:.4f} | "
+        f"RecMacro={test_multi_globals['Recall Macro']:.4f} | "
+        f"F1Macro={test_multi_globals['F1 Macro']:.4f}"
     )
-    log_metric_table(logger, "TEST PER KELAS", class_names, test_bundle)
+    log_metric_table(logger, "TEST PER KELAS SINGLE-LABEL", class_names, test_single_bundle)
+    log_metric_table(logger, "TEST PER KELAS MULTI-KELAS", class_names, test_multi_bundle)
+    log_global_metric_table(logger, "TEST MULTI-KELAS (GLOBAL)", test_multi_globals)
     logger.info(sep2)
 
     logger.info("  BEST LOSS")
@@ -1182,6 +1516,7 @@ def evaluate(
     }
 
     class_metrics = calculate_classification_metrics(all_class_preds, all_tgts, Config.NUM_CLASSES)
+    multiclass_metrics = calculate_multiclass_metrics(all_class_preds, all_tgts, Config.NUM_CLASSES)
     map_metrics = _chunked_map(all_det_preds, all_tgts, Config.NUM_CLASSES, MAP_IOU_THRESHOLDS)
     metrics = {
         'val_loss': avg_losses['class_loss'],
@@ -1190,6 +1525,7 @@ def evaluate(
         'val_loss_bbox': avg_losses['bbox_loss'],
         'val_loss_obj': avg_losses['obj_loss'],
         **class_metrics,
+        **multiclass_metrics,
         **map_metrics,
     }
     return metrics, avg_losses, all_class_preds, all_det_preds, all_tgts, sample_imgs, sample_tgts
@@ -1223,7 +1559,10 @@ def save_checkpoint(model, optimizer, epoch, metrics, fname=None, scheduler=None
 
 
 def run_test_phase(model, criterion, device, class_names, val_tf, logger, epoch_label, checkpoint_path: Path | None = None):
-    test_bundle = init_metric_bundle(Config.NUM_CLASSES)
+    test_single_bundle = init_metric_bundle(Config.NUM_CLASSES, SINGLE_METRIC_ROW_ORDER)
+    test_multi_bundle = init_metric_bundle(Config.NUM_CLASSES, MULTI_PER_CLASS_ROW_ORDER)
+    test_multi_globals = init_best_global_metrics()
+    single_graph_dir, multi_graph_dir = ensure_metric_graph_dirs()
 
     try:
         from torch.utils.data import DataLoader
@@ -1263,15 +1602,17 @@ def run_test_phase(model, criterion, device, class_names, val_tf, logger, epoch_
             logger=logger,
         )
 
-        test_bundle = extract_metric_bundle(test_metrics, Config.NUM_CLASSES)
+        test_single_bundle = extract_metric_bundle(test_metrics, Config.NUM_CLASSES)
+        test_multi_bundle = extract_multiclass_bundle(test_metrics, Config.NUM_CLASSES)
+        test_multi_globals = extract_multiclass_global_metrics(test_metrics)
 
         logger.info(
-            f"  Test mAP@0.50={test_bundle['mAP@0.50']['global']:.4f} | "
-            f"mAP@[0.50:0.95]={test_bundle['mAP@[0.50:0.95]']['global']:.4f} | "
-            f"Acc={test_bundle['Accuracy']['global']:.4f} | "
-            f"Prec={test_bundle['Precision']['global']:.4f} | "
-            f"Rec={test_bundle['Recall']['global']:.4f} | "
-            f"F1={test_bundle['F1-Score']['global']:.4f}"
+            f"  Test mAP@0.50={test_single_bundle['mAP@0.50']['global']:.4f} | "
+            f"mAP@[0.50:0.95]={test_single_bundle['mAP@[0.50:0.95]']['global']:.4f} | "
+            f"AvgAccMulti={test_multi_globals['Average Accuracy']:.4f} | "
+            f"PrecMacro={test_multi_globals['Precision Macro']:.4f} | "
+            f"RecMacro={test_multi_globals['Recall Macro']:.4f} | "
+            f"F1Macro={test_multi_globals['F1 Macro']:.4f}"
         )
 
         generate_confusion_matrix(
@@ -1279,7 +1620,14 @@ def run_test_phase(model, criterion, device, class_names, val_tf, logger, epoch_
             test_tgts,
             Config.NUM_CLASSES,
             class_names=class_names,
-            fname=Config.GRAPHS_DIR / 'confusion_matrix_class_test.png',
+            fname=single_graph_dir / 'confusion_matrix_class_test.png',
+        )
+        generate_confusion_matrix(
+            test_class_preds,
+            test_tgts,
+            Config.NUM_CLASSES,
+            class_names=class_names,
+            fname=multi_graph_dir / 'confusion_matrix_class_test.png',
         )
         generate_detection_confusion_matrix(
             test_det_preds,
@@ -1287,7 +1635,15 @@ def run_test_phase(model, criterion, device, class_names, val_tf, logger, epoch_
             Config.NUM_CLASSES,
             class_names=class_names,
             iou_threshold=0.5,
-            fname=Config.GRAPHS_DIR / 'confusion_matrix_detection_test.png',
+            fname=single_graph_dir / 'confusion_matrix_detection_test.png',
+        )
+        generate_detection_confusion_matrix(
+            test_det_preds,
+            test_tgts,
+            Config.NUM_CLASSES,
+            class_names=class_names,
+            iou_threshold=0.5,
+            fname=multi_graph_dir / 'confusion_matrix_detection_test.png',
         )
 
         if len(sample_imgs) > 0:
@@ -1304,7 +1660,11 @@ def run_test_phase(model, criterion, device, class_names, val_tf, logger, epoch_
         import traceback
         logger.error(f"Error fase Testing: {exc}\n{traceback.format_exc()}")
 
-    return test_bundle
+    return {
+        'single_bundle': test_single_bundle,
+        'multi_bundle': test_multi_bundle,
+        'multi_globals': test_multi_globals,
+    }
 
 
 def train(args):
@@ -1430,6 +1790,7 @@ def train(args):
         device,
         Config.USE_AMP,
     )
+    single_graph_dir, multi_graph_dir = ensure_metric_graph_dirs()
 
     criterion = AnchorFreeLoss(num_classes=Config.NUM_CLASSES)
     optimizer = optim.AdamW(
@@ -1458,8 +1819,12 @@ def train(args):
     best_val_map50_epoch = 0
     best_val_acc = 0.0
     best_val_acc_epoch = 0
-    best_val_bundle = init_metric_bundle(Config.NUM_CLASSES)
-    best_tr_bundle = init_metric_bundle(Config.NUM_CLASSES)
+    best_val_bundle = init_metric_bundle(Config.NUM_CLASSES, SINGLE_METRIC_ROW_ORDER)
+    best_tr_bundle = init_metric_bundle(Config.NUM_CLASSES, SINGLE_METRIC_ROW_ORDER)
+    best_val_multi_bundle = init_metric_bundle(Config.NUM_CLASSES, MULTI_PER_CLASS_ROW_ORDER)
+    best_tr_multi_bundle = init_metric_bundle(Config.NUM_CLASSES, MULTI_PER_CLASS_ROW_ORDER)
+    best_val_multi_globals = init_best_global_metrics()
+    best_tr_multi_globals = init_best_global_metrics()
 
     h_tr_loss = []
     h_val_loss = []
@@ -1484,6 +1849,34 @@ def train(args):
     h_f1 = []
     h_map50 = []
     h_map5095 = []
+
+    h_multi_acc = []
+    h_multi_acc_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_multi_prec_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_multi_rec_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_multi_f1_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_multi_spec_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_multi_prec_micro = []
+    h_multi_rec_micro = []
+    h_multi_f1_micro = []
+    h_multi_prec_macro = []
+    h_multi_rec_macro = []
+    h_multi_f1_macro = []
+    h_multi_error = []
+
+    h_tr_multi_acc = []
+    h_tr_multi_acc_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_tr_multi_prec_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_tr_multi_rec_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_tr_multi_f1_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_tr_multi_spec_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_tr_multi_prec_micro = []
+    h_tr_multi_rec_micro = []
+    h_tr_multi_f1_micro = []
+    h_tr_multi_prec_macro = []
+    h_tr_multi_rec_macro = []
+    h_tr_multi_f1_macro = []
+    h_tr_multi_error = []
 
     btt = float('inf')
     btb = float('inf')
@@ -1513,6 +1906,10 @@ def train(args):
             'best_val_acc_epoch': best_val_acc_epoch,
             'best_val_bundle': best_val_bundle,
             'best_tr_bundle': best_tr_bundle,
+            'best_val_multi_bundle': best_val_multi_bundle,
+            'best_tr_multi_bundle': best_tr_multi_bundle,
+            'best_val_multi_globals': best_val_multi_globals,
+            'best_tr_multi_globals': best_tr_multi_globals,
             'h_tr_loss': h_tr_loss,
             'h_val_loss': h_val_loss,
             'h_tr_bbox': h_tr_bbox,
@@ -1536,6 +1933,32 @@ def train(args):
             'h_f1': h_f1,
             'h_map50': h_map50,
             'h_map5095': h_map5095,
+            'h_multi_acc': h_multi_acc,
+            'h_multi_acc_cls': h_multi_acc_cls,
+            'h_multi_prec_cls': h_multi_prec_cls,
+            'h_multi_rec_cls': h_multi_rec_cls,
+            'h_multi_f1_cls': h_multi_f1_cls,
+            'h_multi_spec_cls': h_multi_spec_cls,
+            'h_multi_prec_micro': h_multi_prec_micro,
+            'h_multi_rec_micro': h_multi_rec_micro,
+            'h_multi_f1_micro': h_multi_f1_micro,
+            'h_multi_prec_macro': h_multi_prec_macro,
+            'h_multi_rec_macro': h_multi_rec_macro,
+            'h_multi_f1_macro': h_multi_f1_macro,
+            'h_multi_error': h_multi_error,
+            'h_tr_multi_acc': h_tr_multi_acc,
+            'h_tr_multi_acc_cls': h_tr_multi_acc_cls,
+            'h_tr_multi_prec_cls': h_tr_multi_prec_cls,
+            'h_tr_multi_rec_cls': h_tr_multi_rec_cls,
+            'h_tr_multi_f1_cls': h_tr_multi_f1_cls,
+            'h_tr_multi_spec_cls': h_tr_multi_spec_cls,
+            'h_tr_multi_prec_micro': h_tr_multi_prec_micro,
+            'h_tr_multi_rec_micro': h_tr_multi_rec_micro,
+            'h_tr_multi_f1_micro': h_tr_multi_f1_micro,
+            'h_tr_multi_prec_macro': h_tr_multi_prec_macro,
+            'h_tr_multi_rec_macro': h_tr_multi_rec_macro,
+            'h_tr_multi_f1_macro': h_tr_multi_f1_macro,
+            'h_tr_multi_error': h_tr_multi_error,
             'btt': btt,
             'btb': btb,
             'btc': btc,
@@ -1595,6 +2018,10 @@ def train(args):
         best_val_acc_epoch = int(resume_state.get('best_val_acc_epoch', best_val_acc_epoch))
         best_val_bundle = resume_state.get('best_val_bundle', best_val_bundle)
         best_tr_bundle = resume_state.get('best_tr_bundle', best_tr_bundle)
+        best_val_multi_bundle = resume_state.get('best_val_multi_bundle', best_val_multi_bundle)
+        best_tr_multi_bundle = resume_state.get('best_tr_multi_bundle', best_tr_multi_bundle)
+        best_val_multi_globals = resume_state.get('best_val_multi_globals', best_val_multi_globals)
+        best_tr_multi_globals = resume_state.get('best_tr_multi_globals', best_tr_multi_globals)
 
         h_tr_loss = resume_state.get('h_tr_loss', h_tr_loss)
         h_val_loss = resume_state.get('h_val_loss', h_val_loss)
@@ -1619,6 +2046,32 @@ def train(args):
         h_f1 = resume_state.get('h_f1', h_f1)
         h_map50 = resume_state.get('h_map50', h_map50)
         h_map5095 = resume_state.get('h_map5095', h_map5095)
+        h_multi_acc = resume_state.get('h_multi_acc', h_multi_acc)
+        h_multi_acc_cls = resume_state.get('h_multi_acc_cls', h_multi_acc_cls)
+        h_multi_prec_cls = resume_state.get('h_multi_prec_cls', h_multi_prec_cls)
+        h_multi_rec_cls = resume_state.get('h_multi_rec_cls', h_multi_rec_cls)
+        h_multi_f1_cls = resume_state.get('h_multi_f1_cls', h_multi_f1_cls)
+        h_multi_spec_cls = resume_state.get('h_multi_spec_cls', h_multi_spec_cls)
+        h_multi_prec_micro = resume_state.get('h_multi_prec_micro', h_multi_prec_micro)
+        h_multi_rec_micro = resume_state.get('h_multi_rec_micro', h_multi_rec_micro)
+        h_multi_f1_micro = resume_state.get('h_multi_f1_micro', h_multi_f1_micro)
+        h_multi_prec_macro = resume_state.get('h_multi_prec_macro', h_multi_prec_macro)
+        h_multi_rec_macro = resume_state.get('h_multi_rec_macro', h_multi_rec_macro)
+        h_multi_f1_macro = resume_state.get('h_multi_f1_macro', h_multi_f1_macro)
+        h_multi_error = resume_state.get('h_multi_error', h_multi_error)
+        h_tr_multi_acc = resume_state.get('h_tr_multi_acc', h_tr_multi_acc)
+        h_tr_multi_acc_cls = resume_state.get('h_tr_multi_acc_cls', h_tr_multi_acc_cls)
+        h_tr_multi_prec_cls = resume_state.get('h_tr_multi_prec_cls', h_tr_multi_prec_cls)
+        h_tr_multi_rec_cls = resume_state.get('h_tr_multi_rec_cls', h_tr_multi_rec_cls)
+        h_tr_multi_f1_cls = resume_state.get('h_tr_multi_f1_cls', h_tr_multi_f1_cls)
+        h_tr_multi_spec_cls = resume_state.get('h_tr_multi_spec_cls', h_tr_multi_spec_cls)
+        h_tr_multi_prec_micro = resume_state.get('h_tr_multi_prec_micro', h_tr_multi_prec_micro)
+        h_tr_multi_rec_micro = resume_state.get('h_tr_multi_rec_micro', h_tr_multi_rec_micro)
+        h_tr_multi_f1_micro = resume_state.get('h_tr_multi_f1_micro', h_tr_multi_f1_micro)
+        h_tr_multi_prec_macro = resume_state.get('h_tr_multi_prec_macro', h_tr_multi_prec_macro)
+        h_tr_multi_rec_macro = resume_state.get('h_tr_multi_rec_macro', h_tr_multi_rec_macro)
+        h_tr_multi_f1_macro = resume_state.get('h_tr_multi_f1_macro', h_tr_multi_f1_macro)
+        h_tr_multi_error = resume_state.get('h_tr_multi_error', h_tr_multi_error)
 
         btt = float(resume_state.get('btt', btt))
         btb = float(resume_state.get('btb', btb))
@@ -1719,24 +2172,45 @@ def train(args):
             bvo, bvo_e = val_losses['obj_loss'], cur_epoch
 
         val_bundle = extract_metric_bundle(val_metrics, Config.NUM_CLASSES)
+        val_multi_bundle = extract_multiclass_bundle(val_metrics, Config.NUM_CLASSES)
+        val_multi_globals = extract_multiclass_global_metrics(val_metrics)
         update_best_metric_bundle(best_val_bundle, val_bundle)
+        update_best_metric_bundle(best_val_multi_bundle, val_multi_bundle)
+        update_best_global_metrics(best_val_multi_globals, val_multi_globals)
 
-        cur_acc = val_bundle['Accuracy']['global']
-        cur_prec = val_bundle['Precision']['global']
-        cur_rec = val_bundle['Recall']['global']
-        cur_f1 = val_bundle['F1-Score']['global']
+        single_acc = val_bundle['Accuracy']['global']
+        single_prec = val_bundle['Precision']['global']
+        single_rec = val_bundle['Recall']['global']
+        single_f1 = val_bundle['F1-Score']['global']
+        cur_acc = val_multi_globals['Average Accuracy']
+        cur_prec = val_multi_globals['Precision Macro']
+        cur_rec = val_multi_globals['Recall Macro']
+        cur_f1 = val_multi_globals['F1 Macro']
         cur_map50 = val_bundle['mAP@0.50']['global']
         cur_map5095 = val_bundle['mAP@[0.50:0.95]']['global']
 
-        h_acc.append(cur_acc)
-        h_prec.append(cur_prec)
-        h_rec.append(cur_rec)
-        h_f1.append(cur_f1)
+        h_acc.append(single_acc)
+        h_prec.append(single_prec)
+        h_rec.append(single_rec)
+        h_f1.append(single_f1)
         h_map50.append(cur_map50)
         h_map5095.append(cur_map5095)
+        h_multi_acc.append(val_multi_globals['Average Accuracy'])
+        h_multi_prec_micro.append(val_multi_globals['Precision Micro'])
+        h_multi_rec_micro.append(val_multi_globals['Recall Micro'])
+        h_multi_f1_micro.append(val_multi_globals['F1 Micro'])
+        h_multi_prec_macro.append(val_multi_globals['Precision Macro'])
+        h_multi_rec_macro.append(val_multi_globals['Recall Macro'])
+        h_multi_f1_macro.append(val_multi_globals['F1 Macro'])
+        h_multi_error.append(val_multi_globals['Error Rate'])
 
         for class_id in range(Config.NUM_CLASSES):
             h_acc_cls[class_id].append(val_bundle['Accuracy']['per_class'][class_id])
+            h_multi_acc_cls[class_id].append(val_multi_bundle['Accuracy']['per_class'][class_id])
+            h_multi_prec_cls[class_id].append(val_multi_bundle['Precision']['per_class'][class_id])
+            h_multi_rec_cls[class_id].append(val_multi_bundle['Recall']['per_class'][class_id])
+            h_multi_f1_cls[class_id].append(val_multi_bundle['F1-Score']['per_class'][class_id])
+            h_multi_spec_cls[class_id].append(val_multi_bundle['Specificity']['per_class'][class_id])
 
         prev_best_map50 = best_val_map50
         prev_best_acc = best_val_acc
@@ -1755,7 +2229,7 @@ def train(args):
             f"TrainLossCls={train_losses['class_loss']:.4f} | ValLossCls={val_losses['class_loss']:.4f} | "
             f"TrainLossTot={train_losses['total_loss']:.4f} | ValLossTot={val_losses['total_loss']:.4f} | "
             f"mAP50={cur_map50:.4f} | mAP5095={cur_map5095:.4f} | "
-            f"Acc={cur_acc:.4f} | Prec={cur_prec:.4f} | Rec={cur_rec:.4f} | F1={cur_f1:.4f}"
+            f"AvgAccMulti={cur_acc:.4f} | PrecMacro={cur_prec:.4f} | RecMacro={cur_rec:.4f} | F1Macro={cur_f1:.4f}"
         )
 
         run_train_table_eval = cur_epoch % train_eval_freq == 0
@@ -1777,7 +2251,11 @@ def train(args):
                 show_progress=run_train_table_eval,
             )
             tr_bundle = extract_metric_bundle(tr_metrics, Config.NUM_CLASSES)
+            tr_multi_bundle = extract_multiclass_bundle(tr_metrics, Config.NUM_CLASSES)
+            tr_multi_globals = extract_multiclass_global_metrics(tr_metrics)
             update_best_metric_bundle(best_tr_bundle, tr_bundle)
+            update_best_metric_bundle(best_tr_multi_bundle, tr_multi_bundle)
+            update_best_global_metrics(best_tr_multi_globals, tr_multi_globals)
 
             x_tr_metrics.append(cur_epoch)
             h_tr_acc.append(tr_bundle['Accuracy']['global'])
@@ -1786,8 +2264,21 @@ def train(args):
             h_tr_f1.append(tr_bundle['F1-Score']['global'])
             h_tr_map50.append(tr_bundle['mAP@0.50']['global'])
             h_tr_map5095.append(tr_bundle['mAP@[0.50:0.95]']['global'])
+            h_tr_multi_acc.append(tr_multi_globals['Average Accuracy'])
+            h_tr_multi_prec_micro.append(tr_multi_globals['Precision Micro'])
+            h_tr_multi_rec_micro.append(tr_multi_globals['Recall Micro'])
+            h_tr_multi_f1_micro.append(tr_multi_globals['F1 Micro'])
+            h_tr_multi_prec_macro.append(tr_multi_globals['Precision Macro'])
+            h_tr_multi_rec_macro.append(tr_multi_globals['Recall Macro'])
+            h_tr_multi_f1_macro.append(tr_multi_globals['F1 Macro'])
+            h_tr_multi_error.append(tr_multi_globals['Error Rate'])
             for class_id in range(Config.NUM_CLASSES):
                 h_tr_acc_cls[class_id].append(tr_bundle['Accuracy']['per_class'][class_id])
+                h_tr_multi_acc_cls[class_id].append(tr_multi_bundle['Accuracy']['per_class'][class_id])
+                h_tr_multi_prec_cls[class_id].append(tr_multi_bundle['Precision']['per_class'][class_id])
+                h_tr_multi_rec_cls[class_id].append(tr_multi_bundle['Recall']['per_class'][class_id])
+                h_tr_multi_f1_cls[class_id].append(tr_multi_bundle['F1-Score']['per_class'][class_id])
+                h_tr_multi_spec_cls[class_id].append(tr_multi_bundle['Specificity']['per_class'][class_id])
 
             if run_train_table_eval:
                 log_per_class_metrics_dual(
@@ -1798,6 +2289,19 @@ def train(args):
                     best_val_bundle,
                     tr_bundle,
                     best_tr_bundle,
+                )
+                log_multiclass_metrics_dual(
+                    logger,
+                    cur_epoch,
+                    class_names,
+                    val_multi_bundle,
+                    best_val_multi_bundle,
+                    val_multi_globals,
+                    best_val_multi_globals,
+                    tr_multi_bundle,
+                    best_tr_multi_bundle,
+                    tr_multi_globals,
+                    best_tr_multi_globals,
                 )
 
             del tr_class_preds, tr_det_preds, tr_tgts
@@ -1834,6 +2338,62 @@ def train(args):
             h_map5095,
             class_names,
             Config.NUM_CLASSES,
+            output_dir=single_graph_dir,
+        )
+        update_multiclass_plots(
+            x_tr=x_tr,
+            x_val=x_val,
+            loss_histories={
+                'train_total': h_tr_loss,
+                'val_total': h_val_loss,
+                'train_bbox': h_tr_bbox,
+                'val_bbox': h_val_bbox,
+                'train_cls': h_tr_cls,
+                'val_cls': h_val_cls,
+                'train_obj': h_tr_obj,
+                'val_obj': h_val_obj,
+            },
+            x_tr_metrics=x_tr_metrics,
+            train_global_hist={
+                'avg_acc': h_tr_multi_acc,
+                'prec_micro': h_tr_multi_prec_micro,
+                'rec_micro': h_tr_multi_rec_micro,
+                'f1_micro': h_tr_multi_f1_micro,
+                'prec_macro': h_tr_multi_prec_macro,
+                'rec_macro': h_tr_multi_rec_macro,
+                'f1_macro': h_tr_multi_f1_macro,
+                'error_rate': h_tr_multi_error,
+            },
+            val_global_hist={
+                'avg_acc': h_multi_acc,
+                'prec_micro': h_multi_prec_micro,
+                'rec_micro': h_multi_rec_micro,
+                'f1_micro': h_multi_f1_micro,
+                'prec_macro': h_multi_prec_macro,
+                'rec_macro': h_multi_rec_macro,
+                'f1_macro': h_multi_f1_macro,
+                'error_rate': h_multi_error,
+            },
+            train_class_hist={
+                'accuracy': h_tr_multi_acc_cls,
+                'precision': h_tr_multi_prec_cls,
+                'recall': h_tr_multi_rec_cls,
+                'f1': h_tr_multi_f1_cls,
+                'specificity': h_tr_multi_spec_cls,
+            },
+            val_class_hist={
+                'accuracy': h_multi_acc_cls,
+                'precision': h_multi_prec_cls,
+                'recall': h_multi_rec_cls,
+                'f1': h_multi_f1_cls,
+                'specificity': h_multi_spec_cls,
+            },
+            h_map50_train=h_tr_map50,
+            h_map5095_train=h_tr_map5095,
+            h_map50_val=h_map50,
+            h_map5095_val=h_map5095,
+            class_names=class_names,
+            output_dir=multi_graph_dir,
         )
 
         generate_confusion_matrix(
@@ -1841,7 +2401,14 @@ def train(args):
             val_tgts,
             Config.NUM_CLASSES,
             class_names=class_names,
-            fname=Config.GRAPHS_DIR / 'confusion_matrix_class_val.png',
+            fname=single_graph_dir / 'confusion_matrix_class_val.png',
+        )
+        generate_confusion_matrix(
+            val_class_preds,
+            val_tgts,
+            Config.NUM_CLASSES,
+            class_names=class_names,
+            fname=multi_graph_dir / 'confusion_matrix_class_val.png',
         )
         generate_detection_confusion_matrix(
             val_det_preds,
@@ -1849,7 +2416,15 @@ def train(args):
             Config.NUM_CLASSES,
             class_names=class_names,
             iou_threshold=0.5,
-            fname=Config.GRAPHS_DIR / 'confusion_matrix_detection_val.png',
+            fname=single_graph_dir / 'confusion_matrix_detection_val.png',
+        )
+        generate_detection_confusion_matrix(
+            val_det_preds,
+            val_tgts,
+            Config.NUM_CLASSES,
+            class_names=class_names,
+            iou_threshold=0.5,
+            fname=multi_graph_dir / 'confusion_matrix_detection_val.png',
         )
 
         checkpoint_metric = getattr(Config, 'CHECKPOINT_METRIC', 'mAP@0.50')
@@ -1912,7 +2487,7 @@ def train(args):
     )
     logger.info(f"  Best Val mAP@0.50 : {best_val_map50:.4f}  (Epoch {best_val_map50_epoch})")
     logger.info(
-        f"  Best Val Accuracy : {best_val_acc:.4f}  (Epoch {best_val_acc_epoch})"
+        f"  Best Val Avg Accuracy Multi : {best_val_acc:.4f}  (Epoch {best_val_acc_epoch})"
         f"{' [checkpoint utama]' if getattr(Config, 'CHECKPOINT_METRIC', 'mAP@0.50') == 'Accuracy' else ''}"
     )
 
@@ -1934,6 +2509,10 @@ def train(args):
         best_val_acc_epoch,
         best_val_bundle,
         best_tr_bundle,
+        best_val_multi_bundle,
+        best_tr_multi_bundle,
+        best_val_multi_globals,
+        best_tr_multi_globals,
         test_bundle,
         final_train_loss,
         final_val_loss,
@@ -1959,7 +2538,7 @@ def train(args):
     logger.info(f"\n  Semua output tersimpan di: {Config.RUN_DIR.resolve()}")
     logger.info("  checkpoints/   (model .pth)")
     logger.info("  logs/          (file .log)")
-    logger.info(f"  graphs/        ({len(list(Config.GRAPHS_DIR.glob('*.png')))} grafik .png)")
+    logger.info(f"  graphs/        ({len(list(Config.GRAPHS_DIR.rglob('*.png')))} grafik .png di single_label/ dan multi_class/)")
     logger.info("  test_results/  (gambar prediksi)")
 
     stage2_classifier_enabled = bool(getattr(Config, "ENABLE_STAGE2_CLASSIFIER", True))

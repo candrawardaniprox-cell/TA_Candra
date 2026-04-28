@@ -29,6 +29,20 @@ class Config:
     BACKBONE_PADDING   = 1
     BACKBONE_NAME      = 'resnet18'
     BACKBONE_PRETRAINED = True
+    # Sumber pretrain backbone:
+    # - "imagenet"    : bobot bawaan TorchVision
+    # - "agriculture" : bobot kustom dari pretraining data pertanian publik
+    # - "internal"    : bobot kustom dari pretraining data sendiri
+    # - "none"        : bobot acak / tanpa pretrain
+    BACKBONE_PRETRAIN_SOURCE = "imagenet"
+    BACKBONE_CUSTOM_WEIGHTS_PATH = None
+    DETECTOR_USE_BACKBONE = True
+    DETECTOR_USE_CTE = True
+    # Mode penting detector:
+    # 1) BACKBONE=True,  CTE=True  -> perilaku default saat ini (ResNet18 + CTE bridge)
+    # 2) BACKBONE=False, CTE=True  -> mode ala paper (CTE mengekstrak fitur awal)
+    # 3) BACKBONE=True,  CTE=False -> backbone aktif tanpa CTE
+    # 4) BACKBONE_NAME='paper'     -> kompatibilitas lama, dipaksa ke mode ala paper
 
     PAPER_CTE_CHANNELS = 32
     PAPER_STAGE_DIMS = [32, 64, 96, 160]
@@ -80,7 +94,11 @@ class Config:
 
     # ==================== Training ====================
     BATCH_SIZE    = 2
+<<<<<<< HEAD
     LEARNING_RATE = 2e-4
+=======
+    LEARNING_RATE = 4e-4
+>>>>>>> 03b6636f5f4b2001b4a16b5429a58b0378e1d13a
     WEIGHT_DECAY  = 1e-2
     EPOCHS        = 50
     WARMUP_EPOCHS = 5
