@@ -283,6 +283,50 @@ def _label_counts(labels: np.ndarray, num_classes: int) -> np.ndarray:
     return counts
 
 
+def _safe_divide(numerator: np.ndarray | float, denominator: np.ndarray | float) -> np.ndarray | float:
+    """Pembagian aman yang mengembalikan 0 saat denominator = 0."""
+    numerator_arr = np.asarray(numerator, dtype=np.float64)
+    denominator_arr = np.asarray(denominator, dtype=np.float64)
+    out = np.zeros_like(numerator_arr, dtype=np.float64)
+    valid = denominator_arr != 0
+    np.divide(numerator_arr, denominator_arr, out=out, where=valid)
+    if np.isscalar(numerator) and np.isscalar(denominator):
+        return float(out.item())
+    return out
+
+
+def _compute_one_vs_all_stats(cm: np.ndarray, num_classes: int, beta: float = 1.0) -> Dict[str, np.ndarray]:
+    """Hitung TP/FP/FN/TN dan metrik one-vs-all per kelas dari confusion matrix."""
+    summary = summarize_confusion_matrix(cm, num_classes)
+    tp = summary['tp']
+    fp = summary['fp']
+    fn = summary['fn']
+    tn = summary['tn']
+    total = tp + fp + fn + tn
+    beta_sq = float(beta) ** 2
+
+    accuracy = _safe_divide(tp + tn, total)
+    precision = _safe_divide(tp, tp + fp)
+    recall = _safe_divide(tp, tp + fn)
+    fscore = _safe_divide((beta_sq + 1.0) * tp, (beta_sq + 1.0) * tp + beta_sq * fn + fp)
+    specificity = _safe_divide(tn, fp + tn)
+    error_rate = _safe_divide(fp + fn, total)
+
+    return {
+        'tp': tp,
+        'fp': fp,
+        'fn': fn,
+        'tn': tn,
+        'total': total,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'fscore': fscore,
+        'specificity': specificity,
+        'error_rate': error_rate,
+    }
+
+
 def build_class_confusion_matrix(
     predictions: List[Dict[str, torch.Tensor]],
     targets: List[Dict[str, torch.Tensor]],
@@ -343,25 +387,12 @@ def calculate_classification_metrics(
 ) -> Dict[str, object]:
     """Hitung Accuracy, Precision, Recall, dan F1 berbasis confusion matrix kelas."""
     cm = build_class_confusion_matrix(predictions, targets, num_classes)
-    total = int(cm.sum())
-
-    accuracy = np.zeros(num_classes, dtype=np.float64)
-    precision = np.zeros(num_classes, dtype=np.float64)
-    recall = np.zeros(num_classes, dtype=np.float64)
-    f1 = np.zeros(num_classes, dtype=np.float64)
-
-    for cls_id in range(num_classes):
-        tp = float(cm[cls_id, cls_id])
-        fp = float(cm[:, cls_id].sum() - tp)
-        fn = float(cm[cls_id, :].sum() - tp)
-        tn = float(total - tp - fp - fn)
-
-        accuracy[cls_id] = (tp + tn) / total if total > 0 else 0.0
-        precision[cls_id] = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall[cls_id] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-
-        denom = precision[cls_id] + recall[cls_id]
-        f1[cls_id] = 2 * precision[cls_id] * recall[cls_id] / denom if denom > 0 else 0.0
+    stats = _compute_one_vs_all_stats(cm, num_classes, beta=1.0)
+    total = float(cm.sum())
+    accuracy = stats['accuracy']
+    precision = stats['precision']
+    recall = stats['recall']
+    f1 = stats['fscore']
 
     tp_total = float(sum(cm[c, c] for c in range(num_classes)))
     fp_total = float(sum(cm[:, c].sum() - cm[c, c] for c in range(num_classes)))
@@ -385,6 +416,63 @@ def calculate_classification_metrics(
         'precision_total': float(total_precision),
         'recall_total': float(total_recall),
         'f1_total': float(total_f1),
+    }
+
+
+def calculate_multiclass_metrics(
+    predictions: List[Dict[str, torch.Tensor]],
+    targets: List[Dict[str, torch.Tensor]],
+    num_classes: int,
+    beta: float = 1.0,
+) -> Dict[str, object]:
+    """
+    Hitung metrik multi-kelas sesuai rumus paper.
+
+    Rumus yang dipakai:
+    - Average Accuracy
+    - Error Rate
+    - Precision / Recall / F-score Micro
+    - Precision / Recall / F-score Macro
+    - Specificity per kelas
+    """
+    cm = build_class_confusion_matrix(predictions, targets, num_classes)
+    stats = _compute_one_vs_all_stats(cm, num_classes, beta=beta)
+    tp = stats['tp']
+    fp = stats['fp']
+    fn = stats['fn']
+    tn = stats['tn']
+    beta_sq = float(beta) ** 2
+
+    precision_micro = _safe_divide(tp.sum(), (tp + fp).sum())
+    recall_micro = _safe_divide(tp.sum(), (tp + fn).sum())
+    f1_micro = _safe_divide(
+        (beta_sq + 1.0) * precision_micro * recall_micro,
+        beta_sq * precision_micro + recall_micro,
+    )
+
+    precision_macro = float(np.mean(stats['precision']))
+    recall_macro = float(np.mean(stats['recall']))
+    f1_macro = _safe_divide(
+        (beta_sq + 1.0) * precision_macro * recall_macro,
+        beta_sq * precision_macro + recall_macro,
+    )
+
+    return {
+        'multiclass_confusion_matrix': cm,
+        'multi_accuracy_per_class': stats['accuracy'],
+        'multi_precision_per_class': stats['precision'],
+        'multi_recall_per_class': stats['recall'],
+        'multi_f1_per_class': stats['fscore'],
+        'multi_specificity_per_class': stats['specificity'],
+        'average_accuracy': float(np.mean(stats['accuracy'])),
+        'error_rate': float(np.mean(stats['error_rate'])),
+        'precision_micro': float(precision_micro),
+        'recall_micro': float(recall_micro),
+        'f1_micro': float(f1_micro),
+        'precision_macro': float(precision_macro),
+        'recall_macro': float(recall_macro),
+        'f1_macro': float(f1_macro),
+        'specificity_macro': float(np.mean(stats['specificity'])),
     }
 
 

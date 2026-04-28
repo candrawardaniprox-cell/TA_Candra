@@ -33,6 +33,21 @@ from .detection_head import AnchorFreeDetectionHead
 from .transformer import CTE, HybridTransformerBlock
 
 
+class ConvFeatureAdapter(nn.Module):
+    """Proyeksi fitur sederhana saat CTE dimatikan."""
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
 class FeatureEmbedding(nn.Module):
     """Feature embedding layer ala paper: downsample x2 lalu proyeksi channel."""
 
@@ -204,10 +219,10 @@ class Scale(nn.Module):
 
 class HybridDetector(nn.Module):
     """
-    Model deteksi dengan encoder utama HTEM-style sesuai paper.
+    Model deteksi hybrid dengan front-end yang bisa diganti via config.
 
     Alur utama:
-      1. HTEM backbone menghasilkan 4 feature maps hierarkis (stride 4/8/16/32)
+      1. Front-end menghasilkan 4 feature maps hierarkis (stride 4/8/16/32)
       2. Semua level diproyeksikan ke channel FPN yang sama
       3. FPN top-down fusion membentuk P2/P3/P4/P5
       4. Detection head dijalankan di semua level
@@ -237,7 +252,18 @@ class HybridDetector(nn.Module):
             getattr(Config, "CLASS_METRIC_SECOND_NMS_IOU_THRESHOLD", 0.20)
         )
 
-        self.use_paper_encoder = getattr(Config, "BACKBONE_NAME", "paper").lower() == "paper"
+        self.backbone_name = str(getattr(Config, "BACKBONE_NAME", "resnet18")).lower()
+        self.use_backbone = bool(getattr(Config, "DETECTOR_USE_BACKBONE", True))
+        self.use_cte = bool(getattr(Config, "DETECTOR_USE_CTE", True))
+        self.use_legacy_paper_mode = self.backbone_name == "paper"
+        if self.use_legacy_paper_mode:
+            self.use_backbone = False
+            self.use_cte = True
+
+        if not self.use_backbone and not self.use_cte:
+            raise ValueError("Detector membutuhkan minimal satu front-end aktif: backbone atau CTE.")
+
+        self.use_paper_encoder = (not self.use_backbone) and self.use_cte
 
         if self.use_paper_encoder:
             stage_dims = list(getattr(Config, "PAPER_STAGE_DIMS", [24, 32, 48, 64]))
@@ -271,13 +297,16 @@ class HybridDetector(nn.Module):
         else:
             expansion_ratio = max(1, transformer_ff_dim // transformer_dim)
             self.backbone = DynamicCNNBackbone(
-                backbone_name=Config.BACKBONE_NAME,
+                backbone_name=self.backbone_name,
                 pretrained=Config.BACKBONE_PRETRAINED,
+                pretrain_source=getattr(Config, "BACKBONE_PRETRAIN_SOURCE", "imagenet"),
+                custom_weights_path=getattr(Config, "BACKBONE_CUSTOM_WEIGHTS_PATH", None),
             )
 
             c3_in = self.backbone.c3_channels
             c4_in = self.backbone.c4_channels
             c2_ch = transformer_dim
+            embedding_cls = CTE if self.use_cte else ConvFeatureAdapter
 
             self.stage_p3 = HybridStage(
                 in_channels=c3_in,
@@ -287,7 +316,7 @@ class HybridDetector(nn.Module):
                 reduction_ratio=2,
                 expansion_ratio=expansion_ratio,
                 dropout=dropout,
-                embedding=CTE(in_channels=c3_in, out_channels=transformer_dim, stride=1),
+                embedding=embedding_cls(in_channels=c3_in, out_channels=transformer_dim, stride=1),
             )
             self.stage_p4 = HybridStage(
                 in_channels=c4_in,
@@ -297,7 +326,7 @@ class HybridDetector(nn.Module):
                 reduction_ratio=2,
                 expansion_ratio=expansion_ratio,
                 dropout=dropout,
-                embedding=CTE(in_channels=c4_in, out_channels=transformer_dim, stride=1),
+                embedding=embedding_cls(in_channels=c4_in, out_channels=transformer_dim, stride=1),
             )
             self.stage_p5 = HybridStage(
                 in_channels=transformer_dim,
@@ -307,7 +336,7 @@ class HybridDetector(nn.Module):
                 reduction_ratio=2,
                 expansion_ratio=expansion_ratio,
                 dropout=dropout,
-                embedding=CTE(in_channels=transformer_dim, out_channels=transformer_dim, stride=2),
+                embedding=embedding_cls(in_channels=transformer_dim, out_channels=transformer_dim, stride=2),
             )
 
             # Tambah level stride 4 ringan agar FPN tetap 4 level.
