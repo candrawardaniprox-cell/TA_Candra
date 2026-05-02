@@ -50,7 +50,7 @@ def collate_fn(batch: List[Dict]) -> Tuple[torch.Tensor, Dict[str, List]]:
     targets = {
         'boxes': boxes_list,
         'labels': labels_list,
-        'image_ids': image_ids
+        'image_ids': image_ids,
     }
 
     return images, targets

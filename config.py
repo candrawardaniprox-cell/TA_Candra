@@ -88,17 +88,13 @@ class Config:
     TRANSFORMER_HEADS   = 4
     TRANSFORMER_LAYERS  = 3
     TRANSFORMER_FF_DIM  = 512
-    TRANSFORMER_DROPOUT = 0.2
+    TRANSFORMER_DROPOUT = 0.175
 
     GRID_SIZE = IMAGE_SIZE // 16
 
     # ==================== Training ====================
     BATCH_SIZE    = 2
-<<<<<<< HEAD
     LEARNING_RATE = 2e-4
-=======
-    LEARNING_RATE = 4e-4
->>>>>>> 03b6636f5f4b2001b4a16b5429a58b0378e1d13a
     WEIGHT_DECAY  = 1e-2
     EPOCHS        = 50
     WARMUP_EPOCHS = 5

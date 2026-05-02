@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 matplotlib.use('Agg')
 
-from notification import play_alert_sequence
+from notification import play_alert_until_action, play_error_alert_sequence
 from config import Config
 from data import (
     ObjectDetectionDataset,
@@ -402,6 +402,19 @@ def extract_multiclass_global_metrics(metrics):
     }
 
 
+def compute_multiclass_monitor_loss(global_metrics):
+    """
+    Loss monitoring tambahan berbasis metrik multi-class.
+
+    Ini tidak dipakai untuk backward/optimisasi; hanya untuk grafik agar
+    performa klasifikasi multi-class bisa dipantau tanpa mengubah loss inti.
+    """
+    avg_acc = float(np.clip(global_metrics.get('Average Accuracy', 0.0), 0.0, 1.0))
+    f1_macro = float(np.clip(global_metrics.get('F1 Macro', 0.0), 0.0, 1.0))
+    error_rate = float(np.clip(global_metrics.get('Error Rate', 1.0 - avg_acc), 0.0, 1.0))
+    return 0.5 * (error_rate + (1.0 - f1_macro))
+
+
 def update_best_metric_bundle(best_bundle, current_bundle):
     for metric_name in best_bundle.keys():
         best_bundle[metric_name]['per_class'] = [
@@ -527,20 +540,35 @@ def print_dataset_summary(logger, train_ds, val_ds, test_ds, num_classes, cls_na
         count_bbox_per_class(test_ds, num_classes)
         if test_ds else ({i: 0 for i in range(num_classes)}, 0)
     )
+    train_repeat = max(1, int(getattr(train_ds, 'repeat_factor', 1)))
+    val_repeat = max(1, int(getattr(val_ds, 'repeat_factor', 1)))
+    test_repeat = max(1, int(getattr(test_ds, 'repeat_factor', 1))) if test_ds else 1
 
     logger.info(sep)
     logger.info("  RINGKASAN DATASET")
     logger.info(sep)
-    logger.info(f"  {'Split':<10} {'Gambar':>10} {'BBox Total':>12}")
-    logger.info(f"  {'Train':<10} {len(train_ds.image_ids):>10,} {tt:>12,}")
-    logger.info(f"  {'Val':<10} {len(val_ds.image_ids):>10,} {vt:>12,}")
-    logger.info(f"  {'Test':<10} {len(test_ds.image_ids) if test_ds else 0:>10,} {et:>12,}")
+    logger.info(
+        f"  {'Split':<10} {'Img Unik':>10} {'Img/Epoch':>10} "
+        f"{'BBox Asli':>12} {'BBox/Epoch':>12}"
+    )
+    logger.info(
+        f"  {'Train':<10} {len(train_ds.image_ids):>10,} {len(train_ds):>10,} "
+        f"{tt:>12,} {tt * train_repeat:>12,}"
+    )
+    logger.info(
+        f"  {'Val':<10} {len(val_ds.image_ids):>10,} {len(val_ds):>10,} "
+        f"{vt:>12,} {vt * val_repeat:>12,}"
+    )
+    logger.info(
+        f"  {'Test':<10} {len(test_ds.image_ids) if test_ds else 0:>10,} "
+        f"{(len(test_ds) if test_ds else 0):>10,} {et:>12,} {et * test_repeat:>12,}"
+    )
     logger.info(sep)
-    logger.info("  BBOX PER KELAS")
-    logger.info(f"  {'Kelas':<15} {'Train':>8} {'Val':>8} {'Test':>8}")
+    logger.info("  BBOX ASLI PER KELAS")
+    logger.info(f"  {'Kelas':<15} {'Train':>8} {'Val':>8} {'Test':>8} {'Train/Epoch':>12}")
     for i in range(num_classes):
         name = cls_names[i].upper() if i < len(cls_names) else f"CLASS_{i}"
-        logger.info(f"  {name:<15} {tc[i]:>8,} {vc[i]:>8,} {ec[i]:>8,}")
+        logger.info(f"  {name:<15} {tc[i]:>8,} {vc[i]:>8,} {ec[i]:>8,} {tc[i] * train_repeat:>12,}")
     logger.info(sep + "\n")
 
 
@@ -641,7 +669,7 @@ def _savefig(filename: str, output_dir: Path | None = None):
     plt.close()
 
 
-def _annotate_best_point(x_values, y_values, mode='max', text='Best Model'):
+def _annotate_best_point(x_values, y_values, mode='max', text='Best Model', ax=None):
     if not x_values or not y_values or len(x_values) != len(y_values):
         return
 
@@ -652,12 +680,13 @@ def _annotate_best_point(x_values, y_values, mode='max', text='Best Model'):
     best_idx = int(np.nanargmax(y_array) if mode == 'max' else np.nanargmin(y_array))
     best_x = x_values[best_idx]
     best_y = y_values[best_idx]
+    target_ax = ax or plt.gca()
 
-    plt.scatter([best_x], [best_y], s=18, c='black', zorder=6)
+    target_ax.scatter([best_x], [best_y], s=18, c='black', zorder=6)
 
     x_offset = 10 if best_idx < max(1, len(x_values) // 2) else -46
     y_offset = -16 if best_y > float(np.nanmean(y_array)) else 12
-    plt.annotate(
+    target_ax.annotate(
         f"{text}\n{best_y:.4f}",
         xy=(best_x, best_y),
         xytext=(x_offset, y_offset),
@@ -763,6 +792,23 @@ def _safe_metric_filename(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ('_', '-') else "_" for ch in name.lower())
 
 
+def build_lr_scheduler(optimizer):
+    scheduler_name = str(getattr(Config, 'LR_SCHEDULER', 'cosine')).strip().lower()
+    if scheduler_name in {'constant', 'fixed', 'none'}:
+        return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+    if scheduler_name == 'step':
+        return optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=max(1, int(getattr(Config, 'LR_STEP_SIZE', 30))),
+            gamma=float(getattr(Config, 'LR_GAMMA', 0.1)),
+        )
+    return optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, int(getattr(Config, 'EPOCHS', 1))),
+        eta_min=float(getattr(Config, 'LEARNING_RATE', 1e-4)) * 0.01,
+    )
+
+
 def save_loss_plot(x_tr, y_tr, x_val, y_val, title, ylabel, fname, output_dir: Path | None = None):
     plt.figure(figsize=(10, 5))
     if x_tr and len(x_tr) == len(y_tr):
@@ -777,6 +823,76 @@ def save_loss_plot(x_tr, y_tr, x_val, y_val, title, ylabel, fname, output_dir: P
     plt.legend()
     plt.grid(True, alpha=0.5)
     _savefig(fname, output_dir=output_dir)
+
+
+def save_multiclass_classification_focus_plot(
+    x_tr,
+    train_cls_loss,
+    x_val,
+    val_cls_loss,
+    x_tr_metrics,
+    train_avg_acc,
+    val_avg_acc,
+    output_dir: Path | None = None,
+):
+    """Grafik fokus evaluasi cabang klasifikasi multi-kelas: loss vs average accuracy."""
+    if (not x_tr or len(x_tr) != len(train_cls_loss)) and (not x_val or len(x_val) != len(val_cls_loss)):
+        return
+
+    fig, ax_loss = plt.subplots(figsize=(10, 5))
+
+    if x_tr and len(x_tr) == len(train_cls_loss):
+        ax_loss.plot(x_tr, train_cls_loss, label='Train Classification Loss', color='royalblue', linewidth=1.8)
+        _annotate_best_point(x_tr, train_cls_loss, mode='min', text='Best Train Loss', ax=ax_loss)
+    if x_val and len(x_val) == len(val_cls_loss):
+        ax_loss.plot(
+            x_val,
+            val_cls_loss,
+            label='Val Classification Loss',
+            color='tomato',
+            linewidth=1.8,
+            marker='o',
+            markersize=4,
+        )
+        _annotate_best_point(x_val, val_cls_loss, mode='min', text='Best Val Loss', ax=ax_loss)
+
+    ax_loss.set_title('Multi-Class Classification Focus: Loss vs Average Accuracy')
+    ax_loss.set_xlabel('Epoch')
+    ax_loss.set_ylabel('Classification Loss')
+    ax_loss.grid(True, alpha=0.5)
+
+    ax_acc = ax_loss.twinx()
+    train_acc_x_dense, train_acc_y_dense = build_dense_epoch_series(x_tr_metrics, train_avg_acc)
+    if train_acc_x_dense and len(train_acc_x_dense) == len(train_acc_y_dense):
+        ax_acc.plot(
+            train_acc_x_dense,
+            train_acc_y_dense,
+            label='Train Avg Accuracy',
+            color='seagreen',
+            linewidth=1.8,
+            linestyle='--',
+        )
+        ax_acc.scatter(x_tr_metrics, train_avg_acc, color='seagreen', marker='s', s=28, zorder=5)
+        _annotate_best_point(x_tr_metrics, train_avg_acc, mode='max', text='Best Train Acc', ax=ax_acc)
+    if x_val and len(x_val) == len(val_avg_acc):
+        ax_acc.plot(
+            x_val,
+            val_avg_acc,
+            label='Val Avg Accuracy',
+            color='mediumseagreen',
+            linewidth=1.8,
+            marker='s',
+            markersize=4,
+        )
+        _annotate_best_point(x_val, val_avg_acc, mode='max', text='Best Val Acc', ax=ax_acc)
+    ax_acc.set_ylabel('Average Accuracy')
+
+    loss_handles, loss_labels = ax_loss.get_legend_handles_labels()
+    acc_handles, acc_labels = ax_acc.get_legend_handles_labels()
+    ax_loss.legend(loss_handles + acc_handles, loss_labels + acc_labels, loc='center right')
+
+    fig.tight_layout()
+    _savefig('multiclass_classification_focus.png', output_dir=output_dir)
 
 
 def update_all_plots(
@@ -970,6 +1086,34 @@ def update_multiclass_plots(
     save_loss_plot(x_tr, loss_histories['train_bbox'], x_val, loss_histories['val_bbox'], 'BBox Regression Loss', 'Loss', 'loss_bbox.png', output_dir=output_dir)
     save_loss_plot(x_tr, loss_histories['train_cls'], x_val, loss_histories['val_cls'], 'Classification Loss', 'Loss', 'loss_cls.png', output_dir=output_dir)
     save_loss_plot(x_tr, loss_histories['train_obj'], x_val, loss_histories['val_obj'], 'Objectness/Centerness', 'Loss', 'loss_obj.png', output_dir=output_dir)
+    x_tr_monitor_dense, h_tr_monitor_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['monitor_loss'])
+    save_dual_metric_plot(
+        x_tr_monitor_dense,
+        h_tr_monitor_dense,
+        x_val,
+        val_global_hist['monitor_loss'],
+        'Train vs Val Multi-Class Monitoring Loss',
+        'Monitoring Loss',
+        'multiclass_monitor_loss.png',
+        'crimson',
+        'salmon',
+        '^',
+        'o',
+        mode='min',
+        train_sparse_x=x_tr_metrics,
+        train_sparse_y=train_global_hist['monitor_loss'],
+        output_dir=output_dir,
+    )
+    save_multiclass_classification_focus_plot(
+        x_tr=x_tr,
+        train_cls_loss=loss_histories['train_cls'],
+        x_val=x_val,
+        val_cls_loss=loss_histories['val_cls'],
+        x_tr_metrics=x_tr_metrics,
+        train_avg_acc=train_global_hist['avg_acc'],
+        val_avg_acc=val_global_hist['avg_acc'],
+        output_dir=output_dir,
+    )
 
     x_tr_acc_dense, h_tr_acc_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['avg_acc'])
     x_tr_prec_macro_dense, h_tr_prec_macro_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['prec_macro'])
@@ -1298,6 +1442,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, device, epo
 
     for batch_idx, (images, targets) in enumerate(pbar):
         batch_name = f"Train E-{epoch:03d} B-{batch_idx + 1:04d}"
+
         if Config.STRICT_TARGET_VALIDATION:
             targets = sanitize_targets(
                 targets,
@@ -1558,6 +1703,51 @@ def save_checkpoint(model, optimizer, epoch, metrics, fname=None, scheduler=None
     return path
 
 
+def save_confusion_matrix_bundle(
+    class_preds,
+    det_preds,
+    tgts,
+    class_names,
+    single_graph_dir,
+    multi_graph_dir,
+    file_tag,
+    iou_threshold=0.5,
+):
+    class_filename = f'confusion_matrix_class_{file_tag}.png'
+    detection_filename = f'confusion_matrix_detection_{file_tag}.png'
+
+    generate_confusion_matrix(
+        class_preds,
+        tgts,
+        Config.NUM_CLASSES,
+        class_names=class_names,
+        fname=single_graph_dir / class_filename,
+    )
+    generate_confusion_matrix(
+        class_preds,
+        tgts,
+        Config.NUM_CLASSES,
+        class_names=class_names,
+        fname=multi_graph_dir / class_filename,
+    )
+    generate_detection_confusion_matrix(
+        det_preds,
+        tgts,
+        Config.NUM_CLASSES,
+        class_names=class_names,
+        iou_threshold=iou_threshold,
+        fname=single_graph_dir / detection_filename,
+    )
+    generate_detection_confusion_matrix(
+        det_preds,
+        tgts,
+        Config.NUM_CLASSES,
+        class_names=class_names,
+        iou_threshold=iou_threshold,
+        fname=multi_graph_dir / detection_filename,
+    )
+
+
 def run_test_phase(model, criterion, device, class_names, val_tf, logger, epoch_label, checkpoint_path: Path | None = None):
     test_single_bundle = init_metric_bundle(Config.NUM_CLASSES, SINGLE_METRIC_ROW_ORDER)
     test_multi_bundle = init_metric_bundle(Config.NUM_CLASSES, MULTI_PER_CLASS_ROW_ORDER)
@@ -1735,35 +1925,64 @@ def train(args):
     )
     val_tf = get_val_transforms(Config.IMAGE_SIZE, Config.MEAN, Config.STD)
 
-    train_ds = ObjectDetectionDataset(
+    def _build_dataset(image_dir, annotation_file, transform, repeat_factor=1):
+        return ObjectDetectionDataset(
+            image_dir,
+            annotation_file,
+            transform=transform,
+            image_size=Config.IMAGE_SIZE,
+            repeat_factor=repeat_factor,
+        )
+
+    train_ds = _build_dataset(
         Config.TRAIN_IMAGES,
         Config.TRAIN_ANNOTATIONS,
-        transform=tr_tf,
-        image_size=Config.IMAGE_SIZE,
+        tr_tf,
         repeat_factor=Config.AUGMENT_REPEAT_FACTOR if Config.AUGMENT else 1,
     )
-    val_ds = ObjectDetectionDataset(
-        Config.VAL_IMAGES,
-        Config.VAL_ANNOTATIONS,
-        transform=val_tf,
-        image_size=Config.IMAGE_SIZE,
-        repeat_factor=1,
-    )
+
+    val_source_name = "val2017"
+    try:
+        val_ds = _build_dataset(
+            Config.VAL_IMAGES,
+            Config.VAL_ANNOTATIONS,
+            val_tf,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Validasi utama gagal dimuat dari %s + %s: %s",
+            Config.VAL_IMAGES,
+            Config.VAL_ANNOTATIONS,
+            exc,
+        )
+        logger.warning(
+            "Menggunakan split test2017 sebagai fallback validasi agar training tetap berjalan."
+        )
+        val_ds = _build_dataset(
+            Config.TEST_IMAGES,
+            Config.TEST_ANNOTATIONS,
+            val_tf,
+        )
+        val_source_name = "test2017 (fallback validasi)"
 
     test_ds = None
     try:
-        test_ds = ObjectDetectionDataset(
+        test_ds = _build_dataset(
             Config.TEST_IMAGES,
             Config.TEST_ANNOTATIONS,
-            transform=val_tf,
-            image_size=Config.IMAGE_SIZE,
-            repeat_factor=1,
+            val_tf,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "Split test tidak dapat dimuat dari %s + %s: %s",
+            Config.TEST_IMAGES,
+            Config.TEST_ANNOTATIONS,
+            exc,
+        )
 
     class_names = Config.COCO_CLASSES if hasattr(Config, 'COCO_CLASSES') else [f"Class_{i}" for i in range(Config.NUM_CLASSES)]
     print_dataset_summary(logger, train_ds, val_ds, test_ds, Config.NUM_CLASSES, class_names)
+    logger.info("Sumber validasi aktif: %s", val_source_name)
 
     train_loader, val_loader = create_dataloaders(
         train_ds,
@@ -1806,17 +2025,14 @@ def train(args):
         ],
         weight_decay=Config.WEIGHT_DECAY,
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=Config.EPOCHS,
-        eta_min=Config.LEARNING_RATE * 0.01,
-    )
+    scheduler = build_lr_scheduler(optimizer)
     scaler = GradScaler('cuda', enabled=Config.USE_AMP)
     start_epoch = 0
 
     best_val_map50 = 0.0
     best_val_map5095 = 0.0
     best_val_map50_epoch = 0
+    best_val_map5095_epoch = 0
     best_val_acc = 0.0
     best_val_acc_epoch = 0
     best_val_bundle = init_metric_bundle(Config.NUM_CLASSES, SINGLE_METRIC_ROW_ORDER)
@@ -1877,6 +2093,8 @@ def train(args):
     h_tr_multi_rec_macro = []
     h_tr_multi_f1_macro = []
     h_tr_multi_error = []
+    h_multi_monitor_loss = []
+    h_tr_multi_monitor_loss = []
 
     btt = float('inf')
     btb = float('inf')
@@ -1902,6 +2120,7 @@ def train(args):
             'best_val_map50': best_val_map50,
             'best_val_map5095': best_val_map5095,
             'best_val_map50_epoch': best_val_map50_epoch,
+            'best_val_map5095_epoch': best_val_map5095_epoch,
             'best_val_acc': best_val_acc,
             'best_val_acc_epoch': best_val_acc_epoch,
             'best_val_bundle': best_val_bundle,
@@ -1959,6 +2178,8 @@ def train(args):
             'h_tr_multi_rec_macro': h_tr_multi_rec_macro,
             'h_tr_multi_f1_macro': h_tr_multi_f1_macro,
             'h_tr_multi_error': h_tr_multi_error,
+            'h_multi_monitor_loss': h_multi_monitor_loss,
+            'h_tr_multi_monitor_loss': h_tr_multi_monitor_loss,
             'btt': btt,
             'btb': btb,
             'btc': btc,
@@ -2002,7 +2223,13 @@ def train(args):
         if 'optimizer_state_dict' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         if 'scheduler_state_dict' in ckpt:
-            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            try:
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            except Exception:
+                logger.warning(
+                    "State scheduler dari checkpoint tidak cocok dengan mode scheduler saat ini. "
+                    "Scheduler akan memakai konfigurasi baru dari config.py."
+                )
         if 'scaler_state_dict' in ckpt:
             try:
                 scaler.load_state_dict(ckpt['scaler_state_dict'])
@@ -2014,6 +2241,7 @@ def train(args):
         best_val_map50 = float(resume_state.get('best_val_map50', best_val_map50))
         best_val_map5095 = float(resume_state.get('best_val_map5095', best_val_map5095))
         best_val_map50_epoch = int(resume_state.get('best_val_map50_epoch', best_val_map50_epoch))
+        best_val_map5095_epoch = int(resume_state.get('best_val_map5095_epoch', best_val_map5095_epoch))
         best_val_acc = float(resume_state.get('best_val_acc', best_val_acc))
         best_val_acc_epoch = int(resume_state.get('best_val_acc_epoch', best_val_acc_epoch))
         best_val_bundle = resume_state.get('best_val_bundle', best_val_bundle)
@@ -2072,6 +2300,8 @@ def train(args):
         h_tr_multi_rec_macro = resume_state.get('h_tr_multi_rec_macro', h_tr_multi_rec_macro)
         h_tr_multi_f1_macro = resume_state.get('h_tr_multi_f1_macro', h_tr_multi_f1_macro)
         h_tr_multi_error = resume_state.get('h_tr_multi_error', h_tr_multi_error)
+        h_multi_monitor_loss = resume_state.get('h_multi_monitor_loss', h_multi_monitor_loss)
+        h_tr_multi_monitor_loss = resume_state.get('h_tr_multi_monitor_loss', h_tr_multi_monitor_loss)
 
         btt = float(resume_state.get('btt', btt))
         btb = float(resume_state.get('btb', btb))
@@ -2203,6 +2433,8 @@ def train(args):
         h_multi_rec_macro.append(val_multi_globals['Recall Macro'])
         h_multi_f1_macro.append(val_multi_globals['F1 Macro'])
         h_multi_error.append(val_multi_globals['Error Rate'])
+        val_monitor_loss = compute_multiclass_monitor_loss(val_multi_globals)
+        h_multi_monitor_loss.append(val_monitor_loss)
 
         for class_id in range(Config.NUM_CLASSES):
             h_acc_cls[class_id].append(val_bundle['Accuracy']['per_class'][class_id])
@@ -2213,27 +2445,25 @@ def train(args):
             h_multi_spec_cls[class_id].append(val_multi_bundle['Specificity']['per_class'][class_id])
 
         prev_best_map50 = best_val_map50
+        prev_best_map5095 = best_val_map5095
         prev_best_acc = best_val_acc
+        is_best_map50 = (best_val_map50_epoch == 0) or (cur_map50 > prev_best_map50)
+        is_best_map5095 = (best_val_map5095_epoch == 0) or (cur_map5095 > prev_best_map5095)
+        is_best_acc = (best_val_acc_epoch == 0) or (cur_acc > prev_best_acc)
 
-        if cur_map50 > best_val_map50:
+        if is_best_map50:
             best_val_map50 = cur_map50
             best_val_map50_epoch = cur_epoch
-        best_val_map5095 = max(best_val_map5095, cur_map5095)
-        if cur_acc > best_val_acc:
+        if is_best_map5095:
+            best_val_map5095 = cur_map5095
+            best_val_map5095_epoch = cur_epoch
+        if is_best_acc:
             best_val_acc = cur_acc
             best_val_acc_epoch = cur_epoch
 
-        epoch_time = train_time + val_time
-        logger.info(
-            f"Epoch {cur_epoch:03d}/{Config.EPOCHS} | {format_time(epoch_time)} | "
-            f"TrainLossCls={train_losses['class_loss']:.4f} | ValLossCls={val_losses['class_loss']:.4f} | "
-            f"TrainLossTot={train_losses['total_loss']:.4f} | ValLossTot={val_losses['total_loss']:.4f} | "
-            f"mAP50={cur_map50:.4f} | mAP5095={cur_map5095:.4f} | "
-            f"AvgAccMulti={cur_acc:.4f} | PrecMacro={cur_prec:.4f} | RecMacro={cur_rec:.4f} | F1Macro={cur_f1:.4f}"
-        )
-
         run_train_table_eval = cur_epoch % train_eval_freq == 0
         run_train_graph_eval = cur_epoch % train_graph_eval_freq == 0
+        train_monitor_loss_for_log = h_tr_multi_monitor_loss[-1] if h_tr_multi_monitor_loss else float('nan')
 
         if run_train_graph_eval:
             if run_train_table_eval:
@@ -2272,6 +2502,8 @@ def train(args):
             h_tr_multi_rec_macro.append(tr_multi_globals['Recall Macro'])
             h_tr_multi_f1_macro.append(tr_multi_globals['F1 Macro'])
             h_tr_multi_error.append(tr_multi_globals['Error Rate'])
+            train_monitor_loss_for_log = compute_multiclass_monitor_loss(tr_multi_globals)
+            h_tr_multi_monitor_loss.append(train_monitor_loss_for_log)
             for class_id in range(Config.NUM_CLASSES):
                 h_tr_acc_cls[class_id].append(tr_bundle['Accuracy']['per_class'][class_id])
                 h_tr_multi_acc_cls[class_id].append(tr_multi_bundle['Accuracy']['per_class'][class_id])
@@ -2307,6 +2539,15 @@ def train(args):
             del tr_class_preds, tr_det_preds, tr_tgts
             gc.collect()
             torch.cuda.empty_cache()
+
+        epoch_time = train_time + val_time
+        logger.info(
+            f"Epoch {cur_epoch:03d}/{Config.EPOCHS} | {format_time(epoch_time)} | "
+            f"TrainLossCls={train_losses['class_loss']:.4f} | ValLossCls={val_losses['class_loss']:.4f} | "
+            f"TrainMonitorLoss={train_monitor_loss_for_log:.4f} | ValMonitorLoss={val_monitor_loss:.4f} | "
+            f"mAP50={cur_map50:.4f} | mAP5095={cur_map5095:.4f} | "
+            f"AvgAccMulti={cur_acc:.4f} | PrecMacro={cur_prec:.4f} | RecMacro={cur_rec:.4f} | F1Macro={cur_f1:.4f}"
+        )
 
         x_tr = list(range(1, len(h_tr_loss) + 1))
         x_val = [i for i in range(1, len(h_tr_loss) + 1) if i % Config.EVAL_FREQUENCY == 0][:len(h_val_loss)]
@@ -2363,6 +2604,7 @@ def train(args):
                 'rec_macro': h_tr_multi_rec_macro,
                 'f1_macro': h_tr_multi_f1_macro,
                 'error_rate': h_tr_multi_error,
+                'monitor_loss': h_tr_multi_monitor_loss,
             },
             val_global_hist={
                 'avg_acc': h_multi_acc,
@@ -2373,6 +2615,7 @@ def train(args):
                 'rec_macro': h_multi_rec_macro,
                 'f1_macro': h_multi_f1_macro,
                 'error_rate': h_multi_error,
+                'monitor_loss': h_multi_monitor_loss,
             },
             train_class_hist={
                 'accuracy': h_tr_multi_acc_cls,
@@ -2396,42 +2639,24 @@ def train(args):
             output_dir=multi_graph_dir,
         )
 
-        generate_confusion_matrix(
-            val_class_preds,
-            val_tgts,
-            Config.NUM_CLASSES,
-            class_names=class_names,
-            fname=single_graph_dir / 'confusion_matrix_class_val.png',
-        )
-        generate_confusion_matrix(
-            val_class_preds,
-            val_tgts,
-            Config.NUM_CLASSES,
-            class_names=class_names,
-            fname=multi_graph_dir / 'confusion_matrix_class_val.png',
-        )
-        generate_detection_confusion_matrix(
-            val_det_preds,
-            val_tgts,
-            Config.NUM_CLASSES,
-            class_names=class_names,
-            iou_threshold=0.5,
-            fname=single_graph_dir / 'confusion_matrix_detection_val.png',
-        )
-        generate_detection_confusion_matrix(
-            val_det_preds,
-            val_tgts,
-            Config.NUM_CLASSES,
-            class_names=class_names,
-            iou_threshold=0.5,
-            fname=multi_graph_dir / 'confusion_matrix_detection_val.png',
-        )
-
-        checkpoint_metric = getattr(Config, 'CHECKPOINT_METRIC', 'mAP@0.50')
-        if checkpoint_metric == 'Accuracy':
-            is_primary_best = cur_acc >= prev_best_acc
+        checkpoint_metric = str(getattr(Config, 'CHECKPOINT_METRIC', 'mAP@0.50')).strip().lower()
+        if checkpoint_metric in {'accuracy', 'avgaccmulti', 'average accuracy', 'average_accuracy'}:
+            is_primary_best = is_best_acc
+        elif checkpoint_metric in {'map@[0.50:0.95]', 'map5095', 'map50:95'}:
+            is_primary_best = is_best_map5095
         else:
-            is_primary_best = cur_map50 >= prev_best_map50
+            is_primary_best = is_best_map50
+
+        if is_primary_best:
+            save_confusion_matrix_bundle(
+                val_class_preds,
+                val_det_preds,
+                val_tgts,
+                class_names=class_names,
+                single_graph_dir=single_graph_dir,
+                multi_graph_dir=multi_graph_dir,
+                file_tag='val',
+            )
 
         if is_primary_best:
             save_checkpoint(
@@ -2444,13 +2669,45 @@ def train(args):
                 scaler=scaler,
                 train_state=current_train_state(),
             )
-        if cur_map50 >= prev_best_map50:
+        if is_best_acc:
+            save_checkpoint(
+                model,
+                optimizer,
+                cur_epoch,
+                val_metrics,
+                'best_accuracy_multi_model.pth',
+                scheduler=scheduler,
+                scaler=scaler,
+                train_state=current_train_state(),
+            )
+        if is_best_map50:
             save_checkpoint(
                 model,
                 optimizer,
                 cur_epoch,
                 val_metrics,
                 'best_map_model.pth',
+                scheduler=scheduler,
+                scaler=scaler,
+                train_state=current_train_state(),
+            )
+            save_checkpoint(
+                model,
+                optimizer,
+                cur_epoch,
+                val_metrics,
+                'best_map50_model.pth',
+                scheduler=scheduler,
+                scaler=scaler,
+                train_state=current_train_state(),
+            )
+        if is_best_map5095:
+            save_checkpoint(
+                model,
+                optimizer,
+                cur_epoch,
+                val_metrics,
+                'best_map5095_model.pth',
                 scheduler=scheduler,
                 scaler=scaler,
                 train_state=current_train_state(),
@@ -2485,10 +2742,28 @@ def train(args):
         f"\n  TRAINING SELESAI | Waktu total: "
         f"{format_time(get_realtime_elapsed(training_session_start, elapsed_time_offset))}"
     )
-    logger.info(f"  Best Val mAP@0.50 : {best_val_map50:.4f}  (Epoch {best_val_map50_epoch})")
+    checkpoint_metric = str(getattr(Config, 'CHECKPOINT_METRIC', 'mAP@0.50')).strip().lower()
+    map50_primary_note = " [checkpoint utama]" if checkpoint_metric not in {
+        'accuracy', 'avgaccmulti', 'average accuracy', 'average_accuracy',
+        'map@[0.50:0.95]', 'map5095', 'map50:95',
+    } else ""
+    map5095_primary_note = " [checkpoint utama]" if checkpoint_metric in {
+        'map@[0.50:0.95]', 'map5095', 'map50:95',
+    } else ""
+    acc_primary_note = " [checkpoint utama]" if checkpoint_metric in {
+        'accuracy', 'avgaccmulti', 'average accuracy', 'average_accuracy',
+    } else ""
+    logger.info(
+        f"  Best Val mAP@0.50 : {best_val_map50:.4f}  (Epoch {best_val_map50_epoch})"
+        f"{map50_primary_note}"
+    )
+    logger.info(
+        f"  Best Val mAP@[0.50:0.95] : {best_val_map5095:.4f}  (Epoch {best_val_map5095_epoch})"
+        f"{map5095_primary_note}"
+    )
     logger.info(
         f"  Best Val Avg Accuracy Multi : {best_val_acc:.4f}  (Epoch {best_val_acc_epoch})"
-        f"{' [checkpoint utama]' if getattr(Config, 'CHECKPOINT_METRIC', 'mAP@0.50') == 'Accuracy' else ''}"
+        f"{acc_primary_note}"
     )
 
     test_bundle = run_test_phase(
@@ -2566,8 +2841,8 @@ def train(args):
     else:
         logger.info("\n  Stage-2 classifier dilewati karena Config.ENABLE_STAGE2_CLASSIFIER=False.")
 
-    # Putar alarm notifikasi training selesai
-    play_alert_sequence()
+    # Putar alarm terus menerus sampai user menekan Enter.
+    play_alert_until_action()
 
 
 if __name__ == "__main__":
@@ -2578,4 +2853,8 @@ if __name__ == "__main__":
     parser.add_argument('--test-only', action='store_true')
     parser.add_argument('--vis-samples', type=int, default=None)
     args = parser.parse_args()
-    train(args)
+    try:
+        train(args)
+    except Exception:
+        play_error_alert_sequence()
+        raise

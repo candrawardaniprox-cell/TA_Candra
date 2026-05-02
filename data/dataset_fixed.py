@@ -32,6 +32,8 @@ class ObjectDetectionDataset(Dataset):
         self.return_dict     = return_dict
         self.min_box_size    = min_box_size
         self.repeat_factor   = max(1, int(repeat_factor))
+        self.skipped_missing_images = 0
+        self.skipped_missing_infos = 0
 
         self._load_annotations()
 
@@ -50,13 +52,56 @@ class ObjectDetectionDataset(Dataset):
             iid = ann['image_id']
             self.image_annotations.setdefault(iid, []).append(ann)
 
-        self.image_ids = list(self.image_annotations.keys())
+        valid_image_ids = []
+        missing_files = []
+        missing_infos = []
+        for image_id in self.image_annotations.keys():
+            info = self.images_info.get(image_id)
+            if info is None:
+                missing_infos.append(image_id)
+                continue
+
+            image_path = self.image_dir / info['file_name']
+            if not image_path.exists():
+                missing_files.append((image_id, info['file_name']))
+                continue
+
+            valid_image_ids.append(image_id)
+
+        self.image_ids = valid_image_ids
+        self.skipped_missing_images = len(missing_files)
+        self.skipped_missing_infos = len(missing_infos)
 
         category_ids            = sorted(self.categories.keys())
         self.category_id_to_idx = {cat_id: idx for idx, cat_id in enumerate(category_ids)}
         self.idx_to_category_id = {idx: cat_id for cat_id, idx in self.category_id_to_idx.items()}
 
-        print(f"Loaded {len(self.image_ids)} images | {len(self.categories)} categories")
+        print(
+            f"Loaded {len(self.image_ids)} valid images | "
+            f"{len(self.categories)} categories"
+        )
+
+        if self.skipped_missing_images > 0:
+            sample_missing = ", ".join(
+                f"{image_id}:{file_name}"
+                for image_id, file_name in missing_files[:3]
+            )
+            print(
+                f"Warning: Melewati {self.skipped_missing_images} anotasi tanpa file gambar "
+                f"di {self.image_dir}. Contoh: {sample_missing}"
+            )
+
+        if self.skipped_missing_infos > 0:
+            print(
+                f"Warning: Melewati {self.skipped_missing_infos} anotasi yang image_id-nya "
+                "tidak ditemukan pada metadata images."
+            )
+
+        if not self.image_ids:
+            raise ValueError(
+                "Tidak ada sample valid setelah sinkronisasi anotasi dan file gambar. "
+                f"image_dir={self.image_dir} | annotation_file={self.annotation_file}"
+            )
 
     def __len__(self) -> int:
         return len(self.image_ids) * self.repeat_factor
@@ -190,7 +235,12 @@ class ObjectDetectionDataset(Dataset):
             labels = torch.from_numpy(labels).long()
 
             if self.return_dict:
-                return {'image': image, 'boxes': boxes, 'labels': labels, 'image_id': image_id}
+                return {
+                    'image': image,
+                    'boxes': boxes,
+                    'labels': labels,
+                    'image_id': image_id,
+                }
             return image, boxes, labels, image_id
 
         except Exception as e:

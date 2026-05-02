@@ -506,40 +506,58 @@ def _plot_confusion_matrix_with_summary(
     title: str,
     fname: str,
 ):
-    """Simpan heatmap confusion matrix + ringkasan TP/FP/FN/TN per kelas."""
+    """Simpan heatmap confusion matrix + total + ringkasan TP/FP/FN/TN."""
     summary = summarize_confusion_matrix(cm, num_classes)
+    num_display_classes = len(classes)
+    cm_display = np.zeros((num_display_classes + 1, num_display_classes + 1), dtype=np.int32)
+    cm_display[:num_display_classes, :num_display_classes] = cm
+    cm_display[:num_display_classes, -1] = cm.sum(axis=1)
+    cm_display[-1, :num_display_classes] = cm.sum(axis=0)
+    cm_display[-1, -1] = cm.sum()
+    display_classes = classes + ['Total']
 
     fig, (ax_cm, ax_text) = plt.subplots(
         1,
         2,
-        figsize=(14, 7),
-        gridspec_kw={'width_ratios': [3.6, 1.9]},
+        figsize=(16, 8),
+        gridspec_kw={'width_ratios': [4.2, 2.4]},
     )
 
-    im = ax_cm.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    total_idx = num_display_classes
+    heatmap_data = cm_display.astype(np.float64).copy()
+    heatmap_data[total_idx, :] = np.nan
+    heatmap_data[:, total_idx] = np.nan
+
+    cmap = plt.cm.Blues.copy()
+    cmap.set_bad(color='white')
+
+    im = ax_cm.imshow(heatmap_data, interpolation='nearest', cmap=cmap)
     ax_cm.set_title(title, fontsize=14)
     fig.colorbar(im, ax=ax_cm, fraction=0.046, pad=0.04)
 
-    tick_marks = np.arange(len(classes))
+    tick_marks = np.arange(len(display_classes))
     ax_cm.set_xticks(tick_marks)
-    ax_cm.set_xticklabels(classes, rotation=45, ha='right', fontsize=10)
+    ax_cm.set_xticklabels(display_classes, rotation=45, ha='right', fontsize=10)
     ax_cm.set_yticks(tick_marks)
-    ax_cm.set_yticklabels(classes, fontsize=10)
+    ax_cm.set_yticklabels(display_classes, fontsize=10)
 
-    thresh = cm.max() / 2.0 if cm.max() > 0 else 1
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
+    thresh = cm_display.max() / 2.0 if cm_display.max() > 0 else 1
+    for i in range(cm_display.shape[0]):
+        for j in range(cm_display.shape[1]):
+            is_total_cell = i == total_idx or j == total_idx
             ax_cm.text(
                 j,
                 i,
-                str(int(cm[i, j])),
+                str(int(cm_display[i, j])),
                 ha='center',
                 va='center',
-                color='white' if cm[i, j] > thresh else 'black',
-                fontsize=11,
+                color='black' if is_total_cell else ('white' if cm_display[i, j] > thresh else 'black'),
+                fontsize=10,
                 fontweight='bold',
             )
 
+    ax_cm.axhline(num_display_classes - 0.5, color='black', linewidth=2.0)
+    ax_cm.axvline(num_display_classes - 0.5, color='black', linewidth=2.0)
     ax_cm.set_ylabel('Ground Truth')
     ax_cm.set_xlabel('Prediction')
 
@@ -556,9 +574,21 @@ def _plot_confusion_matrix_with_summary(
         ])
 
     lines.extend([
-        "Catatan:",
-        f"Baris {classes[-1]} -> false positive",
-        f"Kolom {classes[-1]} -> false negative",
+        "Catatan Perhitungan:",
+        "TP = diagonal kelas",
+        "FP = total kolom kelas - TP",
+        "FN = total baris kelas - TP",
+        "TN = total seluruh sel - TP - FP - FN",
+        "",
+        "Penjelasan Background:",
+        f"Baris {classes[-1]} = prediksi tanpa GT pasangan",
+        f"Kolom {classes[-1]} = GT tanpa prediksi pasangan",
+        "Background tetap ditampilkan agar false positive",
+        "dan false negative yang tidak matched tetap terlihat.",
+        "",
+        "Penjelasan Total:",
+        "Kolom Total = jumlah setiap baris",
+        "Baris Total = jumlah setiap kolom",
     ])
 
     ax_text.text(
