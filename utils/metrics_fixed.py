@@ -429,11 +429,9 @@ def calculate_multiclass_metrics(
     Hitung metrik multi-kelas sesuai rumus paper.
 
     Rumus yang dipakai:
-    - Average Accuracy
-    - Error Rate
-    - Precision / Recall / F-score Micro
-    - Precision / Recall / F-score Macro
-    - Specificity per kelas
+    - Average = rata-rata nilai per kelas
+    - Sistem = jumlahkan TP/FP/FN/TN semua kelas, lalu terapkan rumus biasa
+    - Specificity tetap dihitung per kelas untuk kebutuhan internal
     """
     cm = build_class_confusion_matrix(predictions, targets, num_classes)
     stats = _compute_one_vs_all_stats(cm, num_classes, beta=beta)
@@ -443,19 +441,27 @@ def calculate_multiclass_metrics(
     tn = stats['tn']
     beta_sq = float(beta) ** 2
 
-    precision_micro = _safe_divide(tp.sum(), (tp + fp).sum())
-    recall_micro = _safe_divide(tp.sum(), (tp + fn).sum())
-    f1_micro = _safe_divide(
-        (beta_sq + 1.0) * precision_micro * recall_micro,
-        beta_sq * precision_micro + recall_micro,
-    )
+    tp_total = float(tp.sum())
+    fp_total = float(fp.sum())
+    fn_total = float(fn.sum())
+    tn_total = float(tn.sum())
+    total_system = tp_total + fp_total + fn_total + tn_total
 
-    precision_macro = float(np.mean(stats['precision']))
-    recall_macro = float(np.mean(stats['recall']))
-    f1_macro = _safe_divide(
-        (beta_sq + 1.0) * precision_macro * recall_macro,
-        beta_sq * precision_macro + recall_macro,
+    accuracy_system = _safe_divide(tp_total + tn_total, total_system)
+    precision_system = _safe_divide(tp_total, tp_total + fp_total)
+    recall_system = _safe_divide(tp_total, tp_total + fn_total)
+    f1_system = _safe_divide(
+        (beta_sq + 1.0) * precision_system * recall_system,
+        beta_sq * precision_system + recall_system,
     )
+    error_rate_system = _safe_divide(fp_total + fn_total, total_system)
+
+    accuracy_average = float(np.mean(stats['accuracy']))
+    precision_average = float(np.mean(stats['precision']))
+    recall_average = float(np.mean(stats['recall']))
+    f1_average = float(np.mean(stats['fscore']))
+    specificity_average = float(np.mean(stats['specificity']))
+    error_rate_average = float(np.mean(stats['error_rate']))
 
     return {
         'multiclass_confusion_matrix': cm,
@@ -464,15 +470,30 @@ def calculate_multiclass_metrics(
         'multi_recall_per_class': stats['recall'],
         'multi_f1_per_class': stats['fscore'],
         'multi_specificity_per_class': stats['specificity'],
-        'average_accuracy': float(np.mean(stats['accuracy'])),
-        'error_rate': float(np.mean(stats['error_rate'])),
-        'precision_micro': float(precision_micro),
-        'recall_micro': float(recall_micro),
-        'f1_micro': float(f1_micro),
-        'precision_macro': float(precision_macro),
-        'recall_macro': float(recall_macro),
-        'f1_macro': float(f1_macro),
-        'specificity_macro': float(np.mean(stats['specificity'])),
+        'average_accuracy': float(accuracy_average),
+        'system_accuracy': float(accuracy_system),
+        'average_precision': float(precision_average),
+        'system_precision': float(precision_system),
+        'average_recall': float(recall_average),
+        'system_recall': float(recall_system),
+        'average_f1': float(f1_average),
+        'system_f1': float(f1_system),
+        'average_specificity': float(specificity_average),
+        'average_error_rate': float(error_rate_average),
+        'system_error_rate': float(error_rate_system),
+        'tp_total': tp_total,
+        'fp_total': fp_total,
+        'fn_total': fn_total,
+        'tn_total': tn_total,
+        # Backward-compatible aliases
+        'error_rate': float(error_rate_average),
+        'precision_micro': float(precision_system),
+        'recall_micro': float(recall_system),
+        'f1_micro': float(f1_system),
+        'precision_macro': float(precision_average),
+        'recall_macro': float(recall_average),
+        'f1_macro': float(f1_average),
+        'specificity_macro': float(specificity_average),
     }
 
 

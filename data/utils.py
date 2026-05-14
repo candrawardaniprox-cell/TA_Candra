@@ -6,8 +6,9 @@ handling batching with variable-size bounding boxes.
 """
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from typing import List, Dict, Tuple
+from collections import Counter
 
 
 def collate_fn(batch: List[Dict]) -> Tuple[torch.Tensor, Dict[str, List]]:
@@ -62,8 +63,11 @@ def create_dataloaders(
     batch_size: int = 8,
     num_workers: int = 4,
     pin_memory: bool = True,
-    persistent_workers: bool = True
-) -> Tuple[DataLoader, DataLoader]:
+    persistent_workers: bool = True,
+    use_class_balanced_sampler: bool = False,
+    class_balanced_multipliers: List[float] | None = None,
+    class_balanced_weight_mode: str = "max",
+) -> Tuple[DataLoader, DataLoader, Dict]:
     """
     Create training and validation dataloaders.
 
@@ -76,12 +80,34 @@ def create_dataloaders(
         persistent_workers: Whether to keep workers alive between epochs
 
     Returns:
-        Tuple of (train_loader, val_loader)
+        Tuple of (train_loader, val_loader, sampler_report)
     """
+    train_sampler = None
+    train_shuffle = True
+    sampler_report = {
+        'enabled': False,
+        'mode': str(class_balanced_weight_mode).strip().lower(),
+        'class_counts': {},
+        'class_multipliers': [],
+        'effective_targets': {},
+        'image_weights': [],
+        'num_samples': 0,
+    }
+
+    if use_class_balanced_sampler:
+        train_sampler, sampler_report = build_class_balanced_sampler(
+            train_dataset,
+            class_multipliers=class_balanced_multipliers,
+            weight_mode=class_balanced_weight_mode,
+        )
+        if train_sampler is not None:
+            train_shuffle = False
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
@@ -100,7 +126,96 @@ def create_dataloaders(
         drop_last=False
     )
 
-    return train_loader, val_loader
+    return train_loader, val_loader, sampler_report
+
+
+def build_class_balanced_sampler(
+    dataset,
+    class_multipliers: List[float] | None = None,
+    weight_mode: str = "max",
+):
+    """
+    Bangun WeightedRandomSampler berbasis keberadaan kelas per image.
+
+    class_multipliers:
+        multiplier manual per kelas, mis. [1.195, 1.0, 1.166]
+    weight_mode:
+        - "max"  -> pakai multiplier terbesar dari kelas yang ada di image
+        - "mean" -> rata-rata multiplier kelas yang ada di image
+    """
+    num_classes = len(getattr(dataset, 'category_id_to_idx', {}))
+    multipliers = list(class_multipliers or [1.0] * num_classes)
+    if len(multipliers) < num_classes:
+        multipliers.extend([1.0] * (num_classes - len(multipliers)))
+    multipliers = [max(1.0, float(value)) for value in multipliers[:num_classes]]
+
+    class_counts = Counter()
+    image_class_sets = []
+
+    for image_id in getattr(dataset, 'image_ids', []):
+        anns = dataset.image_annotations.get(image_id, [])
+        present_classes = set()
+
+        for ann in anns:
+            if 'bbox' not in ann or ann.get('area', 0) <= 0:
+                continue
+            cat_id = ann.get('category_id')
+            if cat_id not in dataset.category_id_to_idx:
+                continue
+            cls_idx = dataset.category_id_to_idx[cat_id]
+            class_counts[cls_idx] += 1
+            present_classes.add(cls_idx)
+
+        image_class_sets.append(present_classes)
+
+    if not image_class_sets:
+        return None, {
+            'enabled': False,
+            'mode': str(weight_mode).strip().lower(),
+            'class_counts': {},
+            'class_multipliers': multipliers,
+            'effective_targets': {},
+            'image_weights': [],
+            'num_samples': 0,
+        }
+
+    image_weights_base = []
+    mode = str(weight_mode).strip().lower()
+    for present_classes in image_class_sets:
+        if not present_classes:
+            image_weights_base.append(1.0)
+            continue
+
+        present_values = [multipliers[cls_idx] for cls_idx in present_classes]
+        if mode == "mean":
+            weight = sum(present_values) / max(1, len(present_values))
+        else:
+            weight = max(present_values)
+        image_weights_base.append(float(max(1.0, weight)))
+
+    repeat_factor = max(1, int(getattr(dataset, 'repeat_factor', 1)))
+    image_weights = image_weights_base * repeat_factor
+    sample_weights = torch.as_tensor(image_weights, dtype=torch.double)
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    effective_targets = {}
+    for cls_idx in range(num_classes):
+        effective_targets[cls_idx] = float(class_counts.get(cls_idx, 0)) * multipliers[cls_idx]
+
+    report = {
+        'enabled': True,
+        'mode': mode,
+        'class_counts': {int(k): int(v) for k, v in class_counts.items()},
+        'class_multipliers': multipliers,
+        'effective_targets': effective_targets,
+        'image_weights': image_weights_base,
+        'num_samples': len(sample_weights),
+    }
+    return sampler, report
 
 
 def download_coco_subset(

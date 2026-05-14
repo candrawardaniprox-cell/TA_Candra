@@ -28,16 +28,16 @@ class Config:
     BACKBONE_KERNEL_SIZE = 3
     BACKBONE_PADDING   = 1
     BACKBONE_NAME      = 'resnet18'
-    BACKBONE_PRETRAINED = True
+    BACKBONE_PRETRAINED = True  
     # Sumber pretrain backbone:
     # - "imagenet"    : bobot bawaan TorchVision
     # - "agriculture" : bobot kustom dari pretraining data pertanian publik
     # - "internal"    : bobot kustom dari pretraining data sendiri
     # - "none"        : bobot acak / tanpa pretrain
-    BACKBONE_PRETRAIN_SOURCE = "imagenet"
+    BACKBONE_PRETRAIN_SOURCE = "imagenet" 
     BACKBONE_CUSTOM_WEIGHTS_PATH = None
     DETECTOR_USE_BACKBONE = True
-    DETECTOR_USE_CTE = True
+    DETECTOR_USE_CTE = True  
     # Mode penting detector:
     # 1) BACKBONE=True,  CTE=True  -> perilaku default saat ini (ResNet18 + CTE bridge)
     # 2) BACKBONE=False, CTE=True  -> mode ala paper (CTE mengekstrak fitur awal)
@@ -88,15 +88,15 @@ class Config:
     TRANSFORMER_HEADS   = 4
     TRANSFORMER_LAYERS  = 3
     TRANSFORMER_FF_DIM  = 512
-    TRANSFORMER_DROPOUT = 0.175
+    TRANSFORMER_DROPOUT = 0.15 
 
     GRID_SIZE = IMAGE_SIZE // 16
 
     # ==================== Training ====================
     BATCH_SIZE    = 2
     LEARNING_RATE = 2e-4
-    WEIGHT_DECAY  = 1e-2
-    EPOCHS        = 50
+    WEIGHT_DECAY  = 1e-2 
+    EPOCHS        = 50 
     WARMUP_EPOCHS = 5
 
     LR_SCHEDULER = "cosine"
@@ -112,7 +112,7 @@ class Config:
     LAMBDA_OBJ   = 0.25
     LAMBDA_NOOBJ = 5.0
     LAMBDA_BBOX  = 1.00
-    LAMBDA_CLASS = 1.75
+    LAMBDA_CLASS = 0.40   
     CLASS_PRIORITY_MODE = True
 
     BBOX_LOSS_TYPE    = "giou"
@@ -130,8 +130,8 @@ class Config:
     CLASS_CONF_THRESHOLD    = 0.35
     CLASS_NMS_IOU_THRESHOLD = 0.40
     CLASS_MAX_DETECTIONS    = 10
-    CLASS_METRIC_CONF_THRESHOLD = 0.45
-    CLASS_METRIC_NMS_IOU_THRESHOLD = 0.30
+    CLASS_METRIC_CONF_THRESHOLD = 0.40 
+    CLASS_METRIC_NMS_IOU_THRESHOLD = 0.25
     CLASS_METRIC_MAX_DETECTIONS = 10
     CLASS_METRIC_USE_CENTERNESS = False
     CLASS_METRIC_USE_SECOND_NMS = True
@@ -156,8 +156,11 @@ class Config:
     PIN_MEMORY         = True
     PERSISTENT_WORKERS = True
 
-    AUGMENT                   = False
+    AUGMENT                   = True 
     AUGMENT_REPEAT_FACTOR     = 1
+    USE_CLASS_BALANCED_SAMPLER = True 
+    CLASS_BALANCED_IMAGE_MULTIPLIER = [1.309, 1.0, 1.343] # [moler, slabung, ulat_grayak]  
+    CLASS_BALANCED_IMAGE_WEIGHT_MODE = "max"           # max | mean
     MEDIAN_BLUR_PROB          = 0.2
     MEDIAN_BLUR_LIMIT         = 3
     HORIZONTAL_FLIP_PROB      = 0.5
@@ -267,6 +270,8 @@ class Config:
         print(f"Learning Rate : {cls.LEARNING_RATE}")
         print(f"Device        : {cls.DEVICE}")
         print(f"Augmentasi    : {cls.AUGMENT}")
+        print(f"Balanced Samp : {cls.USE_CLASS_BALANCED_SAMPLER}")
+        print(f"Sample Mult   : {cls.CLASS_BALANCED_IMAGE_MULTIPLIER}")
         print(f"Class Alpha   : {cls.LOSS_CLASS_ALPHA}")
         print(f"Class Mult    : {cls.LOSS_CLASS_MULTIPLIER}")
         print("=" * 60)
