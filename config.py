@@ -95,9 +95,15 @@ class Config:
     # ==================== Training ====================
     BATCH_SIZE    = 2
     LEARNING_RATE = 2e-4
-    WEIGHT_DECAY  = 1e-2 
+    WEIGHT_DECAY  = 1e-5  
     EPOCHS        = 50 
     WARMUP_EPOCHS = 5
+    OPTIMIZER     = True
+    OPTIMIZER_TYPE = "SGD + momentum"  # Pilihan: "AdamW" | "SGD + momentum"
+    SGD_MOMENTUM  = 0.9
+    SGD_NESTEROV  = False
+    ALERT_SOUND_PATH = None
+    ERROR_ALERT_SOUND_PATH = None
 
     LR_SCHEDULER = "cosine"
     LR_STEP_SIZE = 30

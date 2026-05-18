@@ -7,8 +7,14 @@ import threading
 import time
 import wave
 from datetime import datetime
+from pathlib import Path
 
 import winsound
+
+try:
+    from config import Config
+except Exception:
+    Config = None
 
 _SND_SYNC = getattr(winsound, "SND_SYNC", 0)
 
@@ -122,6 +128,32 @@ def _play_wave(wave_bytes, fallback_sequence=None):
         _play_beep_sequence(fallback_sequence)
 
 
+def _resolve_sound_path(path_value):
+    if not path_value:
+        return None
+    candidate = Path(path_value).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    if candidate.exists() and candidate.is_file():
+        return candidate
+    return None
+
+
+def _play_sound_file(sound_path):
+    try:
+        winsound.PlaySound(str(sound_path), winsound.SND_FILENAME | _SND_SYNC)
+        return True
+    except RuntimeError:
+        return False
+
+
+def _play_custom_or_fallback(sound_path, fallback_sequence):
+    resolved_path = _resolve_sound_path(sound_path)
+    if resolved_path is not None and _play_sound_file(resolved_path):
+        return
+    _play_wave(_build_alarm_wave(fallback_sequence), fallback_sequence=fallback_sequence)
+
+
 def _default_alarm_sequence():
     """Phone-like alarm pattern with short pauses and layered tones."""
     return [
@@ -177,7 +209,8 @@ def play_alert_sequence():
     print("=" * 80)
 
     sequence = _default_alarm_sequence()
-    _play_wave(_build_alarm_wave(sequence), fallback_sequence=sequence)
+    custom_sound_path = getattr(Config, "ALERT_SOUND_PATH", None) if Config is not None else None
+    _play_custom_or_fallback(custom_sound_path, sequence)
 
     print(f"Waktu Selesai: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 80 + "\n")
@@ -196,7 +229,10 @@ def play_error_alert_sequence():
         {"type": "silence", "duration": 0.10},
         {"type": "tone", "primary": 520, "secondary": 780, "duration": 0.55, "volume": 1.0},
     ]
-    _play_wave(_build_alarm_wave(error_sequence), fallback_sequence=error_sequence)
+    custom_sound_path = getattr(Config, "ERROR_ALERT_SOUND_PATH", None) if Config is not None else None
+    if not custom_sound_path and Config is not None:
+        custom_sound_path = getattr(Config, "ALERT_SOUND_PATH", None)
+    _play_custom_or_fallback(custom_sound_path, error_sequence)
 
     print(f"Waktu Error: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 80 + "\n")
@@ -210,11 +246,18 @@ def play_alert_until_action():
     print("=" * 80)
 
     stop_beep = threading.Event()
-    alarm_wave = _build_alarm_wave(_default_alarm_sequence())
+    sequence = _default_alarm_sequence()
+    custom_sound_path = getattr(Config, "ALERT_SOUND_PATH", None) if Config is not None else None
+    resolved_custom_sound = _resolve_sound_path(custom_sound_path)
+    alarm_wave = _build_alarm_wave(sequence)
 
     def alarm_forever():
         while not stop_beep.is_set():
-            _play_wave(alarm_wave, fallback_sequence=_default_alarm_sequence())
+            if resolved_custom_sound is not None:
+                if not _play_sound_file(resolved_custom_sound):
+                    _play_wave(alarm_wave, fallback_sequence=sequence)
+            else:
+                _play_wave(alarm_wave, fallback_sequence=sequence)
             time.sleep(0.15)
 
     beep_thread = threading.Thread(target=alarm_forever)

@@ -661,7 +661,7 @@ def print_class_balanced_sampler_summary(logger, sampler_report, cls_names):
     logger.info(sep + "\n")
 
 
-def print_model_config(logger, model, num_classes, image_size, batch_size, lr, epochs, device, use_amp):
+def print_model_config(logger, model, num_classes, image_size, batch_size, lr, epochs, device, use_amp, optimizer_name):
     sep = "=" * 70
 
     def num_params(module):
@@ -675,8 +675,11 @@ def print_model_config(logger, model, num_classes, image_size, batch_size, lr, e
     logger.info(f"  Batch Size        : {batch_size}")
     logger.info(f"  Learning Rate     : {lr}")
     logger.info(f"  Epochs            : {epochs}")
-    logger.info(f"  Optimize          : AdamW")
+    logger.info(f"  Optimize          : {optimizer_name}")
     logger.info(f"  Weight Decay      : {getattr(Config, 'WEIGHT_DECAY', 0.0)}")
+    if _normalize_optimizer_name(optimizer_name) == 'sgd_momentum':
+        logger.info(f"  Momentum          : {getattr(Config, 'SGD_MOMENTUM', 0.9)}")
+        logger.info(f"  Nesterov          : {getattr(Config, 'SGD_NESTEROV', False)}")
     logger.info(f"  Scheduler         : {getattr(Config, 'LR_SCHEDULER', 'none')}")
     logger.info(f"  Warmup Epochs     : {getattr(Config, 'WARMUP_EPOCHS', 0)}")
     logger.info(f"  Grad Clip Norm    : {getattr(Config, 'GRAD_CLIP_NORM', 0.0)}")
@@ -921,6 +924,58 @@ def build_lr_scheduler(optimizer):
         T_max=max(1, int(getattr(Config, 'EPOCHS', 1))),
         eta_min=float(getattr(Config, 'LEARNING_RATE', 1e-4)) * 0.01,
     )
+
+
+def _normalize_optimizer_name(name) -> str:
+    raw = str(name or 'adamw').strip().lower()
+    simplified = raw.replace('_', '').replace('-', '').replace(' ', '').replace('+', '')
+    if simplified in {'adamw', 'adam'}:
+        return 'adamw'
+    if simplified in {'sgdmomentum', 'sgdwithmomentum', 'sgdmomentum'}:
+        return 'sgd_momentum'
+    raise ValueError(
+        "Config.OPTIMIZER_TYPE tidak dikenali. Gunakan 'AdamW' atau 'SGD + momentum'."
+    )
+
+
+def get_optimizer_name() -> str:
+    optimizer_enabled = bool(getattr(Config, 'OPTIMIZER', True))
+    optimizer_type = getattr(Config, 'OPTIMIZER_TYPE', 'AdamW')
+    normalized = _normalize_optimizer_name(optimizer_type if optimizer_enabled else 'AdamW')
+    if normalized == 'sgd_momentum':
+        return 'SGD + momentum'
+    return 'AdamW'
+
+
+def build_optimizer(model):
+    param_groups = [
+        {
+            'params': [p for n, p in model.named_parameters() if 'backbone' in n],
+            'lr': Config.LEARNING_RATE * 0.1,
+        },
+        {
+            'params': [p for n, p in model.named_parameters() if 'backbone' not in n],
+            'lr': Config.LEARNING_RATE,
+        },
+    ]
+
+    optimizer_name = get_optimizer_name()
+    normalized = _normalize_optimizer_name(optimizer_name)
+
+    if normalized == 'sgd_momentum':
+        optimizer = optim.SGD(
+            param_groups,
+            momentum=float(getattr(Config, 'SGD_MOMENTUM', 0.9)),
+            weight_decay=Config.WEIGHT_DECAY,
+            nesterov=bool(getattr(Config, 'SGD_NESTEROV', False)),
+        )
+    else:
+        optimizer = optim.AdamW(
+            param_groups,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+    return optimizer, optimizer_name
 
 
 def save_loss_plot(x_tr, y_tr, x_val, y_val, title, ylabel, fname, output_dir: Path | None = None, note_text: str | None = None):
@@ -1812,6 +1867,7 @@ def save_checkpoint(model, optimizer, epoch, metrics, fname=None, scheduler=None
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'optimizer_name': get_optimizer_name(),
         'metrics': metrics,
     }
     if scheduler is not None:
@@ -2102,23 +2158,12 @@ def train(args):
         Config.EPOCHS,
         device,
         Config.USE_AMP,
+        get_optimizer_name(),
     )
     metric_graph_dir = ensure_metric_graph_dirs()
 
     criterion = AnchorFreeLoss(num_classes=Config.NUM_CLASSES)
-    optimizer = optim.AdamW(
-        [
-            {
-                'params': [p for n, p in model.named_parameters() if 'backbone' in n],
-                'lr': Config.LEARNING_RATE * 0.1,
-            },
-            {
-                'params': [p for n, p in model.named_parameters() if 'backbone' not in n],
-                'lr': Config.LEARNING_RATE,
-            },
-        ],
-        weight_decay=Config.WEIGHT_DECAY,
-    )
+    optimizer, optimizer_name = build_optimizer(model)
     scheduler = build_lr_scheduler(optimizer)
     scaler = GradScaler('cuda', enabled=Config.USE_AMP)
     start_epoch = 0
@@ -2291,7 +2336,22 @@ def train(args):
         model.load_state_dict(ckpt['model_state_dict'])
 
         if 'optimizer_state_dict' in ckpt:
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            saved_optimizer_name = ckpt.get('optimizer_name')
+            if saved_optimizer_name and saved_optimizer_name != optimizer_name:
+                logger.warning(
+                    "Optimizer checkpoint (%s) berbeda dengan config saat ini (%s). "
+                    "State optimizer lama akan dicoba dimuat; jika tidak cocok akan diabaikan.",
+                    saved_optimizer_name,
+                    optimizer_name,
+                )
+            try:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            except Exception:
+                logger.warning(
+                    "State optimizer dari checkpoint tidak cocok dengan optimizer %s saat ini. "
+                    "Training akan memakai state optimizer baru dari config.py.",
+                    optimizer_name,
+                )
         if 'scheduler_state_dict' in ckpt:
             try:
                 scheduler.load_state_dict(ckpt['scheduler_state_dict'])
