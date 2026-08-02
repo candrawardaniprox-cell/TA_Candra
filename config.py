@@ -1,0 +1,346 @@
+"""
+config.py — Konfigurasi Hybrid CNN-Transformer Object Detection.
+
+Perubahan:
+  - BASE_OUTPUT_DIR: folder induk semua output.
+  - Folder run per-eksperimen (timestamped) dibuat otomatis di train.py.
+  - Struktur folder output:
+      outputs/
+        run_YYYYMMDD_HHMMSS/
+          checkpoints/  ← model .pth
+          logs/         ← file .log
+          graphs/       ← semua gambar grafik .png
+          test_results/ ← gambar perbandingan hasil prediksi
+"""
+from __future__ import annotations
+
+import torch
+from pathlib import Path
+
+
+class Config:
+    """Semua hyperparameter dan pengaturan sistem."""
+
+    # ==================== Arsitektur Model ====================
+    IMAGE_SIZE   = 640 
+    NUM_CLASSES  = 3
+
+    # Pilihan model detector:
+    # - "hybrid"    : CNN-Transformer Hybrid (Vikhe et al., 2025) — model utama
+    # - "plain_cnn" : Plain CNN baseline (LeCun et al., 1998)
+    # - "resnet"    : ResNet-18 murni (He et al., CVPR 2016)
+    # - "vgg16"     : VGG-16-BN murni (Simonyan & Zisserman, ICLR 2015)
+    # - "mobilenet" : MobileNetV2 ringan (Sandler et al., CVPR 2018)
+    MODEL_TYPE   = "mobilenet"                 
+    BACKBONE_CHANNELS  = [3, 32, 64, 128, 256]
+    BACKBONE_KERNEL_SIZE = 3
+    BACKBONE_PADDING   = 1
+    BACKBONE_NAME      = 'resnet18'
+    BACKBONE_PRETRAINED = True  
+    BACKBONE_FREEZE    = False    # True = kunci bobot backbone (tidak ikut training), False = normal
+    # Sumber pretrain backbone:
+    # - "imagenet"    : bobot bawaan TorchVision
+    # - "agriculture" : bobot kustom dari pretraining data pertanian publik
+    # - "internal"    : bobot kustom dari pretraining data sendiri
+    # - "none"        : bobot acak / tanpa pretrain
+    BACKBONE_PRETRAIN_SOURCE = "imagenet" 
+    BACKBONE_CUSTOM_WEIGHTS_PATH = None
+    DETECTOR_USE_BACKBONE =True 
+    DETECTOR_USE_CTE = True  
+    # Mode penting detector:
+    # 1) BACKBONE=True,  CTE=True  -> perilaku default saat ini (ResNet18 + CTE bridge)
+    # 2) BACKBONE=False, CTE=True  -> mode ala paper (CTE mengekstrak fitur awal)
+    # 3) BACKBONE=True,  CTE=False -> backbone aktif tanpa CTE
+    # 4) BACKBONE_NAME='paper'     -> kompatibilitas lama, dipaksa ke mode ala paper
+
+    PAPER_CTE_CHANNELS = 32
+    PAPER_STAGE_DIMS = [32, 64, 96, 160]
+    PAPER_STAGE_LAYOUT = [2, 2, 4, 2]  
+    PAPER_STAGE_HEADS = [1, 2, 4, 8]           
+    PAPER_STAGE_REDUCTIONS = [8, 4, 2, 1]
+    PAPER_LFFN_EXPANSION_RATIO = 4
+    PAPER_LFFN_KERNEL_SIZE = 3
+    PAPER_EMBED_KERNEL_SIZE = 2
+
+    # ==================== Stage-2 Classifier ====================
+    CLASSIFIER_IMAGE_SIZE = 224
+    CLASSIFIER_BATCH_SIZE = 24
+    CLASSIFIER_LEARNING_RATE = 1e-4
+    CLASSIFIER_WEIGHT_DECAY = 1e-4
+    CLASSIFIER_EPOCHS = 30
+    CLASSIFIER_DROPOUT = 0.2
+    CLASSIFIER_NUM_WORKERS = 0
+    CLASSIFIER_BLAS_NUM_THREADS = 1
+    CLASSIFIER_CROP_PADDING = 0.15
+    CLASSIFIER_MIN_CROP_SIZE = 12
+    CLASSIFIER_LABEL_SMOOTHING = 0.05
+    CLASSIFIER_CHECKPOINT_NAME = "best_classifier.pth"
+    CLASSIFIER_SAVE_VISUALIZATIONS = True
+    CLASSIFIER_VIS_MAX_IMAGES = 100
+    ENABLE_STAGE2_CLASSIFIER = False
+
+    # Ambang keputusan aman untuk deployment dua tahap.
+    STAGE2_CLASS_THRESHOLDS = [0.90, 0.85, 0.85]  # moler, slabung, ulat_grayak
+    STAGE2_MIN_MARGIN = 0.15
+    STAGE2_UNKNOWN_NAME = "unknown"
+    STAGE2_ACTION_MAP = [
+        "cabut_tanaman",
+        "semprot_pestisida_slabung",
+        "semprot_pestisida_ulat_grayak",
+        "no_action",
+    ]
+    STAGE2_PROPOSAL_CONF_THRESHOLD = 0.15
+    STAGE2_PROPOSAL_NMS_IOU_THRESHOLD = 0.50
+    STAGE2_PROPOSAL_MAX_DETECTIONS = 20
+
+    TRANSFORMER_DIM     = 128
+    TRANSFORMER_HEADS   = 2 
+    TRANSFORMER_LAYERS  = 1
+    TRANSFORMER_FF_DIM  = 256
+    TRANSFORMER_DROPOUT = 0.15  
+
+    GRID_SIZE = IMAGE_SIZE // 16      
+
+    # ==================== Training ====================
+    BATCH_SIZE    = 2
+    LEARNING_RATE = 2e-4
+    WEIGHT_DECAY  = 1e-4  
+    EPOCHS        = 70   
+    WARMUP_EPOCHS = 5
+    OPTIMIZER     = True
+    OPTIMIZER_TYPE = "SGD + momentum" #Pilihan: "AdamW" | "SGD + momentum" | "muon + MuSGD" | "RMSProp" | "adam"  
+    SGD_MOMENTUM  = 0.9
+    SGD_NESTEROV  = True    
+    RMSPROP_ALPHA = 0.99
+    RMSPROP_EPS = 1e-8
+    RMSPROP_CENTERED = True  
+    MUSGD_MUON_WEIGHT = 0.5
+    MUSGD_SGD_WEIGHT  = 0.5
+    ALERT_SOUND_PATH = None
+    ERROR_ALERT_SOUND_PATH = None
+
+    # Pilihan LR Scheduler:
+    # - "cosine"   : CosineAnnealingLR (smooth decay hingga akhir epoch)
+    # - "step"     : StepLR — turunkan LR setiap LR_STEP_SIZE epoch dengan faktor LR_GAMMA
+    # - "constant" : LR tetap (tidak berubah selama training)
+    # - "none"     / "fixed" : sama dengan "constant"
+    LR_SCHEDULER = "cosine"
+    LR_STEP_SIZE = 30    # Turunkan LR setiap 40 epoch (hanya untuk scheduler "step")
+    LR_GAMMA     = 0.1    # Faktor pengali LR setiap step (0.5 = setengah LR tiap step)
+
+    GRAD_CLIP_NORM = 1.0
+    USE_AMP        = False
+    CUDA_BENCHMARK = True
+    ALLOW_TF32     = True
+
+    # ==================== Early Stopping ====================
+    # Aktifkan/nonaktifkan early stopping.
+    #   True  = training berhenti otomatis jika metrik tidak membaik selama PATIENCE epoch.
+    #   False = training berjalan penuh sampai EPOCHS selesai.
+    EARLY_STOPPING          = True  
+    EARLY_STOPPING_PATIENCE = 10      # Jumlah epoch tanpa perbaikan sebelum berhenti
+    EARLY_STOPPING_MIN_DELTA = 0.001  # Peningkatan minimum yang dianggap "membaik"
+    # Metrik yang dimonitor untuk early stopping:
+    #   "mAP@0.50"            : val mAP@0.50 (default)
+    #   "mAP@[0.50:0.95]"     : val mAP@[0.50:0.95]
+    #   "val_loss"             : validation total loss (semakin kecil semakin baik)
+    #   "average_accuracy"     : val average accuracy multi-label
+    EARLY_STOPPING_METRIC   = "mAP@0.50"
+
+    # ==================== Loss ====================
+    LAMBDA_OBJ   = 0.25
+    LAMBDA_NOOBJ = 3.0
+    LAMBDA_BBOX  = 1.00 
+    LAMBDA_CLASS = 0.40       
+    CLASS_PRIORITY_MODE = True
+
+    BBOX_LOSS_TYPE    = "giou"
+    USE_FOCAL_LOSS    = True
+    FOCAL_ALPHA       = 0.25 
+    FOCAL_GAMMA       = 2.0
+
+    IOU_THRESHOLD_POS = 0.4
+    IOU_THRESHOLD_NEG = 0.3
+
+    # ==================== Inference ====================
+    CONF_THRESHOLD     = 0.35
+    NMS_IOU_THRESHOLD  = 0.40
+    MAX_DETECTIONS     = 12
+    CLASS_CONF_THRESHOLD    = 0.35
+    CLASS_NMS_IOU_THRESHOLD = 0.40
+    CLASS_MAX_DETECTIONS    = 10
+    CLASS_METRIC_CONF_THRESHOLD = 0.40 
+    CLASS_METRIC_NMS_IOU_THRESHOLD = 0.25
+    CLASS_METRIC_MAX_DETECTIONS = 10
+    CLASS_METRIC_USE_CENTERNESS = False
+    CLASS_METRIC_USE_SECOND_NMS = True
+    CLASS_METRIC_SECOND_NMS_IOU_THRESHOLD = 0.20
+    DET_CONF_THRESHOLD      = 0.20
+    DET_NMS_IOU_THRESHOLD   = 0.50
+    DET_MAX_DETECTIONS      = 50
+    DET_PRE_NMS_TOPK        = 300
+    USE_CENTERNESS_IN_SCORE = True
+    CENTERNESS_SCORE_WEIGHT = 0.35
+
+    # ==================== Data ====================
+    # Pilihan skenario data latih (Tabel 4.8):
+    #   "scenario_25"      : 25% data latih (Few-Shot)
+    #   "scenario_50"      : 50% data latih (Moderate)
+    #   "scenario_75"      : 75% data latih (Extensive)
+    #   "scenario_100"     : 100% data latih (Full)
+    #   "augmented_2026"   : Dataset2026 augmented + balanced (~5000 bbox/kelas)
+    #   "coco_copy"        : Menggunakan dataset dari folder 'coco copy'
+    # Cukup ganti nilai SCENARIO untuk menjalankan percobaan berbeda.
+    SCENARIO = "coco_copy"     
+
+    _SCENARIO_FOLDERS = {
+        "scenario_25":  "scenario_25",
+        "scenario_50":  "scenario_50",
+        "scenario_75":  "scenario_75",
+        "scenario_100": "scenario_100",
+        "augmented_2026": "Dataset2026_split",
+        "coco_copy": "coco copy", 
+    }
+
+    DATA_ROOT          = Path("data") / _SCENARIO_FOLDERS[SCENARIO]
+    TRAIN_IMAGES       = DATA_ROOT / "train2017"
+    VAL_IMAGES         = DATA_ROOT / "val2017"
+    TEST_IMAGES        = DATA_ROOT / "test2017"
+    TRAIN_ANNOTATIONS  = DATA_ROOT / "annotations_coco" / "instances_train2017.json"
+    VAL_ANNOTATIONS    = DATA_ROOT / "annotations_coco" / "instances_val2017.json"
+    TEST_ANNOTATIONS   = DATA_ROOT / "annotations_coco" / "instances_test2017.json"
+
+    NUM_WORKERS        = 2
+    PIN_MEMORY         = True
+    PERSISTENT_WORKERS = True
+
+    AUGMENT                   = True
+    AUGMENT_REPEAT_FACTOR     = 1   
+    USE_CLASS_BALANCED_SAMPLER = True 
+    CLASS_BALANCED_IMAGE_MULTIPLIER = [2, 3.1035, 3.7365] # [moler, slabung, ulat_grayak]              
+    CLASS_BALANCED_IMAGE_WEIGHT_MODE = "max"           # max | mean
+    MEDIAN_BLUR_PROB          = 0.2
+    MEDIAN_BLUR_LIMIT         = 3
+    HORIZONTAL_FLIP_PROB      = 0.5
+    VERTICAL_FLIP_PROB        = 0.2
+    ROTATE_PROB               = 0.25
+    ROTATE_LIMIT              = 12
+    RANDOM_RESIZED_CROP_PROB  = 0.2
+    RANDOM_RESIZED_CROP_SCALE = (0.85, 1.0)
+    SHIFT_SCALE_ROTATE_PROB   = 0.35
+    SHIFT_LIMIT               = 0.06
+    SCALE_LIMIT               = 0.12
+    COLOR_JITTER_PROB         = 0.5
+    COLOR_JITTER_BRIGHTNESS   = 0.2
+    COLOR_JITTER_CONTRAST     = 0.2
+    COLOR_JITTER_SATURATION   = 0.2
+    COLOR_JITTER_HUE          = 0.00
+    RANDOM_BRIGHTNESS_CONTRAST_PROB = 0.35
+    CLAHE_PROB                = 0.15
+
+    CLASSIFIER_HORIZONTAL_FLIP_PROB = 0.5
+    CLASSIFIER_VERTICAL_FLIP_PROB = 0.1
+    CLASSIFIER_ROTATE_LIMIT = 10
+    CLASSIFIER_ROTATE_PROB = 0.25
+    CLASSIFIER_COLOR_JITTER_PROB = 0.4
+    CLASSIFIER_RANDOM_BRIGHTNESS_CONTRAST_PROB = 0.3
+    CLASSIFIER_CLAHE_PROB = 0.1
+
+    MEAN = [0.485, 0.456, 0.406]
+    STD  = [0.229, 0.224, 0.225]
+
+    # ==================== Output — SATU FOLDER INDUK ====================
+    # Semua output (checkpoint, log, grafik, test result) disimpan di sini.
+    # train.py akan membuat subfolder run_YYYYMMDD_HHMMSS/ di dalamnya.
+    BASE_OUTPUT_DIR = Path("outputs")
+
+    # Path-path di bawah ini diisi oleh train.py setelah RUN_DIR dibuat.
+    # Jangan diubah manual.
+    CHECKPOINT_DIR  = BASE_OUTPUT_DIR / "checkpoints"   # fallback jika train.py belum set
+    LOG_DIR         = BASE_OUTPUT_DIR / "logs"
+    GRAPHS_DIR      = BASE_OUTPUT_DIR / "graphs"
+    TEST_RESULT_DIR = BASE_OUTPUT_DIR / "test_results"
+    CLASSIFIER_CHECKPOINT_PATH = BASE_OUTPUT_DIR / CLASSIFIER_CHECKPOINT_NAME
+
+    # ==================== Checkpoint & Logging ====================
+    SAVE_FREQUENCY         = 5
+    KEEP_LAST_N_CHECKPOINTS = 3
+    LOG_FREQUENCY          = 10
+    USE_TENSORBOARD        = False   # Dimatikan; pakai file PNG
+
+    # ==================== Evaluasi ====================
+    EVAL_IOU_THRESHOLDS = [0.5]
+    EVAL_FREQUENCY      = 1   # Validasi setiap N epoch
+    TRAIN_EVAL_FREQUENCY = 10  # Evaluasi train set setiap N epoch (untuk per-class metrics)
+    TRAIN_GRAPH_EVAL_FREQUENCY = 1  # Hitung metrik train untuk titik grafik setiap N epoch
+    TEST_VIS_SAMPLES    = 300  # Jumlah gambar visualisasi saat testing
+    CHECKPOINT_METRIC   = "mAP@0.50"
+    STRICT_TARGET_VALIDATION = True
+    SKIP_INVALID_BATCHES = True
+    CUDA_DEBUG_SYNC = False
+    EMPTY_CACHE_PER_EVAL_BATCH = False
+
+    # ==================== Device ====================
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ==================== Nama Kelas ====================
+    COCO_CLASSES = ['moler', 'slabung', 'ulat_grayak']
+    CLASS_COLORS = [
+        (0, 0, 255),    # moler       -> merah (BGR)
+        (0, 255, 0),    # slabung     -> hijau
+        (255, 0, 0),    # ulat_grayak -> biru
+    ]
+
+    # ==================== Bobot Kelas Loss ====================
+    # Diperkuat untuk slabung dan ulat_grayak (lihat loss_fixed.py)
+    LOSS_CLASS_ALPHA      = [0.3, 0.3, 0.3]   # focal alpha per kelas
+    LOSS_CLASS_MULTIPLIER = [1.8,  1.8,  1.8]      # pengali bobot per kelas 
+
+    @classmethod
+    def setup_run_dirs(cls, run_dir: Path):
+        """Dipanggil dari train.py untuk mengatur semua subfolder output."""
+        cls.RUN_DIR        = run_dir
+        cls.CHECKPOINT_DIR = run_dir / "checkpoints"
+        cls.LOG_DIR        = run_dir / "logs"
+        cls.GRAPHS_DIR     = run_dir / "graphs"
+        cls.TEST_RESULT_DIR = run_dir / "test_results"
+        cls.CLASSIFIER_CHECKPOINT_PATH = cls.CHECKPOINT_DIR / cls.CLASSIFIER_CHECKPOINT_NAME
+
+        for d in [cls.CHECKPOINT_DIR, cls.LOG_DIR,
+                  cls.GRAPHS_DIR, cls.TEST_RESULT_DIR]:
+            d.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def create_directories(cls):
+        """Buat folder dasar jika belum ada."""
+        cls.BASE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        cls.DATA_ROOT.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def print_config(cls):
+        print("=" * 60)
+        print("Hybrid CNN-Transformer Object Detection — Config")
+        print("=" * 60)
+        print(f"Image Size    : {cls.IMAGE_SIZE}×{cls.IMAGE_SIZE}")
+        print(f"Num Classes   : {cls.NUM_CLASSES}  {cls.COCO_CLASSES}")
+        print(f"Batch Size    : {cls.BATCH_SIZE}")
+        print(f"Epochs        : {cls.EPOCHS}")
+        print(f"Learning Rate : {cls.LEARNING_RATE}")
+        print(f"Device        : {cls.DEVICE}")
+        print(f"Augmentasi    : {cls.AUGMENT}")
+        print(f"Balanced Samp : {cls.USE_CLASS_BALANCED_SAMPLER}")
+        print(f"Sample Mult   : {cls.CLASS_BALANCED_IMAGE_MULTIPLIER}")
+        print(f"Class Alpha   : {cls.LOSS_CLASS_ALPHA}")
+        print(f"Class Mult    : {cls.LOSS_CLASS_MULTIPLIER}")
+        if cls.EARLY_STOPPING:
+            print(f"Early Stop    : ON  (patience={cls.EARLY_STOPPING_PATIENCE}, "
+                  f"min_delta={cls.EARLY_STOPPING_MIN_DELTA}, metric={cls.EARLY_STOPPING_METRIC})")
+        else:
+            print(f"Early Stop    : OFF")
+        print("=" * 60)
+
+
+config = Config()
+
+if __name__ == "__main__":
+    Config.print_config()

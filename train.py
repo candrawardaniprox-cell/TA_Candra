@@ -1,0 +1,3103 @@
+from __future__ import annotations
+"""
+train.py - Training script untuk Hybrid CNN-Transformer object detection.
+
+Versi ini memakai evaluasi confusion matrix berbasis jumlah kelas per gambar:
+- Mengabaikan IoU/bounding-box matching untuk confusion matrix dan metrik kelas.
+- Fokus ke Accuracy, Precision, Recall, dan F1-Score.
+- Menjaga output visual bbox agar warna kelas konsisten antara GT dan prediksi.
+"""
+
+import argparse
+import gc
+import logging
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.optim as optim
+from torch.amp import GradScaler, autocast
+from tqdm import tqdm
+
+matplotlib.use('Agg')
+
+from notification import play_alert_until_action, play_error_alert_sequence
+from config import Config
+from data import (
+    ObjectDetectionDataset,
+    create_dataloaders,
+    get_train_transforms,
+    get_val_transforms,
+)
+from models import HybridDetector, PlainCNNDetector, ResNetDetector, VGGDetector
+from utils import AnchorFreeLoss, calculate_map
+from utils.metrics_fixed import (
+    calculate_multiclass_metrics,
+    generate_confusion_matrix,
+    generate_detection_confusion_matrix,
+)
+from utils.visualization import draw_bounding_boxes
+from train_classifier import train_classifier as train_stage2_classifier
+
+MAP_IOU_THRESHOLDS = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+SINGLE_METRIC_ROW_ORDER = [
+    'Accuracy',
+    'Precision',
+    'Recall',
+    'F1-Score',
+    'mAP@0.50',
+    'mAP@[0.50:0.95]',
+]
+MULTI_PER_CLASS_ROW_ORDER = [
+    'Accuracy',
+    'Precision',
+    'Recall',
+    'F1-Score',
+    'mAP@0.50',
+    'mAP@[0.50:0.95]',
+]
+MULTI_GLOBAL_METRIC_ORDER = [
+    'Average Accuracy',
+    'System Accuracy',
+    'Average Precision',
+    'System Precision',
+    'Average Recall',
+    'System Recall',
+    'Average F1',
+    'System F1',
+]
+
+
+def sanitize_targets(targets, num_classes, image_size, logger=None, batch_name=None):
+    """
+    Bersihkan target batch di CPU sebelum dipakai model/loss.
+
+    Tujuan:
+    - mencegah label out-of-range dipakai sebagai index CUDA
+    - membuang bbox NaN/Inf atau ukuran <= 0
+    - merapikan shape tensor yang tidak sesuai
+    """
+    clean_boxes = []
+    clean_labels = []
+    skipped = []
+
+    for idx, (boxes, labels) in enumerate(zip(targets['boxes'], targets['labels'])):
+        image_id = targets.get('image_ids', [None] * len(targets['boxes']))[idx]
+
+        if not isinstance(boxes, torch.Tensor):
+            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        else:
+            boxes = boxes.detach().cpu().float()
+
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.as_tensor(labels, dtype=torch.long)
+        else:
+            labels = labels.detach().cpu().long()
+
+        if boxes.numel() == 0:
+            boxes = boxes.reshape(0, 4)
+            labels = labels.reshape(0)
+            clean_boxes.append(boxes)
+            clean_labels.append(labels)
+            continue
+
+        if boxes.ndim != 2 or boxes.shape[-1] != 4:
+            skipped.append(f"image_id={image_id} shape_boxes={tuple(boxes.shape)}")
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.long)
+            clean_boxes.append(boxes)
+            clean_labels.append(labels)
+            continue
+
+        labels = labels.reshape(-1)
+        pair_count = min(boxes.shape[0], labels.shape[0])
+        if pair_count != boxes.shape[0] or pair_count != labels.shape[0]:
+            skipped.append(
+                f"image_id={image_id} mismatch_boxes={boxes.shape[0]} mismatch_labels={labels.shape[0]}"
+            )
+        boxes = boxes[:pair_count]
+        labels = labels[:pair_count]
+
+        if pair_count == 0:
+            clean_boxes.append(torch.zeros((0, 4), dtype=torch.float32))
+            clean_labels.append(torch.zeros((0,), dtype=torch.long))
+            continue
+
+        valid = torch.isfinite(boxes).all(dim=1)
+        valid &= torch.isfinite(labels.float())
+        valid &= boxes[:, 2] > 1e-6
+        valid &= boxes[:, 3] > 1e-6
+        valid &= labels >= 0
+        valid &= labels < num_classes
+
+        removed = int((~valid).sum().item())
+        if removed:
+            skipped.append(f"image_id={image_id} removed={removed}")
+
+        boxes = boxes[valid]
+        labels = labels[valid]
+
+        if boxes.numel() == 0:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.long)
+        else:
+            boxes[:, 0] = boxes[:, 0].clamp(0.0, float(image_size))
+            boxes[:, 1] = boxes[:, 1].clamp(0.0, float(image_size))
+            boxes[:, 2] = boxes[:, 2].clamp(1e-6, float(image_size))
+            boxes[:, 3] = boxes[:, 3].clamp(1e-6, float(image_size))
+            labels = labels.long()
+
+        clean_boxes.append(boxes)
+        clean_labels.append(labels)
+
+    if skipped and logger is not None:
+        prefix = f"{batch_name} | " if batch_name else ""
+        logger.warning("%sTarget sanitization: %s", prefix, "; ".join(skipped[:8]))
+
+    return {
+        'boxes': clean_boxes,
+        'labels': clean_labels,
+        'image_ids': list(targets.get('image_ids', [])),
+    }
+
+
+def cleanup_cuda_after_error():
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def setup_run(resume_checkpoint: Path = None) -> Path:
+    Config.create_directories()
+    if resume_checkpoint is not None:
+        run_dir = resume_checkpoint.resolve().parent.parent
+    else:
+        run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_dir = Config.BASE_OUTPUT_DIR / run_name
+    Config.setup_run_dirs(run_dir)
+    return run_dir
+
+
+def resolve_resume_checkpoint(resume_arg: str) -> Path | None:
+    if not resume_arg:
+        return None
+
+    path = Path(resume_arg)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.resolve()
+
+    if path.is_file():
+        return path
+
+    if not path.exists():
+        raise FileNotFoundError(f"Resume path tidak ditemukan: {path}")
+
+    ckpt_dir = path / "checkpoints" if (path / "checkpoints").exists() else path
+
+    latest_ckpt = ckpt_dir / "latest_checkpoint.pth"
+    if latest_ckpt.exists():
+        return latest_ckpt
+
+    epoch_ckpts = sorted(
+        ckpt_dir.glob("checkpoint_epoch_*.pth"),
+        key=lambda p: int(p.stem.split("_")[-1]) if p.stem.split("_")[-1].isdigit() else -1,
+    )
+    if epoch_ckpts:
+        return epoch_ckpts[-1]
+
+    best_ckpt = ckpt_dir / "best_model.pth"
+    if best_ckpt.exists():
+        return best_ckpt
+
+    raise FileNotFoundError(f"Tidak menemukan checkpoint resume di: {ckpt_dir}")
+
+
+def resolve_evaluation_checkpoint(checkpoint_arg: str) -> Path | None:
+    if not checkpoint_arg:
+        return None
+
+    path = Path(checkpoint_arg)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.resolve()
+
+    if path.is_file():
+        return path
+
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint evaluasi tidak ditemukan: {path}")
+
+    ckpt_dir = path / "checkpoints" if (path / "checkpoints").exists() else path
+
+    best_ckpt = ckpt_dir / "best_model.pth"
+    if best_ckpt.exists():
+        return best_ckpt
+
+    latest_ckpt = ckpt_dir / "latest_checkpoint.pth"
+    if latest_ckpt.exists():
+        return latest_ckpt
+
+    epoch_ckpts = sorted(
+        ckpt_dir.glob("checkpoint_epoch_*.pth"),
+        key=lambda p: int(p.stem.split("_")[-1]) if p.stem.split("_")[-1].isdigit() else -1,
+    )
+    if epoch_ckpts:
+        return epoch_ckpts[-1]
+
+    raise FileNotFoundError(f"Tidak menemukan checkpoint evaluasi di: {ckpt_dir}")
+
+
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger('object_detection')
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        logger.handlers.clear()
+
+    log_file = Config.LOG_DIR / f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    stream_handler = logging.StreamHandler()
+    file_handler.setFormatter(formatter)
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger
+
+
+def format_time(seconds: float) -> str:
+    return f"{int(seconds) // 60}m {int(seconds) % 60:02d}s"
+
+
+def get_realtime_elapsed(session_start_time: float | None, elapsed_offset: float = 0.0) -> float:
+    if session_start_time is None:
+        return float(elapsed_offset)
+    return max(0.0, float(elapsed_offset) + (time.time() - session_start_time))
+
+
+def init_metric_bundle(num_classes, metric_rows=None):
+    metric_rows = metric_rows or SINGLE_METRIC_ROW_ORDER
+    zeros = [0.0] * num_classes
+    return {
+        metric_name: {
+            'per_class': list(zeros),
+            'average': 0.0,
+            'system': 0.0,
+        }
+        for metric_name in metric_rows
+    }
+
+
+def _metric_row(per_class, average_value, system_value):
+    return {
+        'per_class': list(per_class),
+        'average': float(average_value),
+        'system': float(system_value),
+    }
+
+
+def normalize_metric_bundle(bundle, num_classes, metric_rows=None):
+    normalized = init_metric_bundle(num_classes, metric_rows=metric_rows)
+    if not isinstance(bundle, dict):
+        return normalized
+
+    for metric_name, target in normalized.items():
+        source = bundle.get(metric_name, {})
+        per_class = source.get('per_class', target['per_class'])
+        average_value = source.get('average', source.get('global', target['average']))
+        system_value = source.get('system', source.get('global', target['system']))
+        normalized[metric_name] = _metric_row(per_class[:num_classes], average_value, system_value)
+    return normalized
+
+
+def normalize_global_metrics(metrics):
+    metrics = metrics or {}
+    return {
+        'Average Accuracy': float(metrics.get('Average Accuracy', metrics.get('average_accuracy', 0.0))),
+        'System Accuracy': float(metrics.get('System Accuracy', metrics.get('Average Accuracy', metrics.get('average_accuracy', 0.0)))),
+        'Average Precision': float(metrics.get('Average Precision', metrics.get('Precision Macro', metrics.get('precision_macro', 0.0)))),
+        'System Precision': float(metrics.get('System Precision', metrics.get('Precision Micro', metrics.get('precision_micro', 0.0)))),
+        'Average Recall': float(metrics.get('Average Recall', metrics.get('Recall Macro', metrics.get('recall_macro', 0.0)))),
+        'System Recall': float(metrics.get('System Recall', metrics.get('Recall Micro', metrics.get('recall_micro', 0.0)))),
+        'Average F1': float(metrics.get('Average F1', metrics.get('F1 Macro', metrics.get('f1_macro', 0.0)))),
+        'System F1': float(metrics.get('System F1', metrics.get('F1 Micro', metrics.get('f1_micro', 0.0)))),
+        'Average Error Rate': float(metrics.get('Average Error Rate', metrics.get('Error Rate', metrics.get('error_rate', 1.0)))),
+        'System Error Rate': float(metrics.get('System Error Rate', metrics.get('Error Rate', metrics.get('error_rate', 1.0)))),
+    }
+
+
+def extract_metric_bundle(metrics, num_classes):
+    map50_per_class = [
+        float(metrics.get(f'AP@0.50_class_{class_id}', 0.0))
+        for class_id in range(num_classes)
+    ]
+    map5095_per_class = []
+    for class_id in range(num_classes):
+        ap_values = [
+            float(metrics.get(f'AP@{thr:.2f}_class_{class_id}', 0.0))
+            for thr in MAP_IOU_THRESHOLDS
+        ]
+        map5095_per_class.append(float(np.mean(ap_values)) if ap_values else 0.0)
+
+    return {
+        'Accuracy': _metric_row(
+            metrics.get('accuracy_per_class', np.zeros(num_classes))[:num_classes],
+            metrics.get('accuracy_total', 0.0),
+            metrics.get('accuracy_total', 0.0),
+        ),
+        'Precision': _metric_row(
+            metrics.get('precision_per_class', np.zeros(num_classes))[:num_classes],
+            metrics.get('precision_total', 0.0),
+            metrics.get('precision_total', 0.0),
+        ),
+        'Recall': _metric_row(
+            metrics.get('recall_per_class', np.zeros(num_classes))[:num_classes],
+            metrics.get('recall_total', 0.0),
+            metrics.get('recall_total', 0.0),
+        ),
+        'F1-Score': _metric_row(
+            metrics.get('f1_per_class', np.zeros(num_classes))[:num_classes],
+            metrics.get('f1_total', 0.0),
+            metrics.get('f1_total', 0.0),
+        ),
+        'mAP@0.50': _metric_row(
+            map50_per_class,
+            metrics.get('mAP@0.50', 0.0),
+            metrics.get('mAP@0.50', 0.0),
+        ),
+        'mAP@[0.50:0.95]': _metric_row(
+            map5095_per_class,
+            metrics.get('mAP@[0.5:0.95]', 0.0),
+            metrics.get('mAP@[0.5:0.95]', 0.0),
+        ),
+    }
+
+
+def extract_multiclass_bundle(metrics, num_classes):
+    map50_per_class = [
+        float(metrics.get(f'AP@0.50_class_{class_id}', 0.0))
+        for class_id in range(num_classes)
+    ]
+    map5095_per_class = []
+    for class_id in range(num_classes):
+        ap_values = [
+            float(metrics.get(f'AP@{thr:.2f}_class_{class_id}', 0.0))
+            for thr in MAP_IOU_THRESHOLDS
+        ]
+        map5095_per_class.append(float(np.mean(ap_values)) if ap_values else 0.0)
+
+    return {
+        'Accuracy': _metric_row(
+            metrics.get('multi_accuracy_per_class', np.zeros(num_classes))[:num_classes],
+            metrics.get('average_accuracy', 0.0),
+            metrics.get('system_accuracy', 0.0),
+        ),
+        'Precision': _metric_row(
+            metrics.get('multi_precision_per_class', np.zeros(num_classes))[:num_classes],
+            metrics.get('average_precision', metrics.get('precision_macro', 0.0)),
+            metrics.get('system_precision', metrics.get('precision_micro', 0.0)),
+        ),
+        'Recall': _metric_row(
+            metrics.get('multi_recall_per_class', np.zeros(num_classes))[:num_classes],
+            metrics.get('average_recall', metrics.get('recall_macro', 0.0)),
+            metrics.get('system_recall', metrics.get('recall_micro', 0.0)),
+        ),
+        'F1-Score': _metric_row(
+            metrics.get('multi_f1_per_class', np.zeros(num_classes))[:num_classes],
+            metrics.get('average_f1', metrics.get('f1_macro', 0.0)),
+            metrics.get('system_f1', metrics.get('f1_micro', 0.0)),
+        ),
+        'mAP@0.50': _metric_row(
+            map50_per_class,
+            metrics.get('mAP@0.50', 0.0),
+            metrics.get('mAP@0.50', 0.0),
+        ),
+        'mAP@[0.50:0.95]': _metric_row(
+            map5095_per_class,
+            metrics.get('mAP@[0.5:0.95]', 0.0),
+            metrics.get('mAP@[0.5:0.95]', 0.0),
+        ),
+    }
+
+
+def extract_multiclass_global_metrics(metrics):
+    return {
+        'Average Accuracy': float(metrics.get('average_accuracy', 0.0)),
+        'System Accuracy': float(metrics.get('system_accuracy', metrics.get('average_accuracy', 0.0))),
+        'Average Precision': float(metrics.get('average_precision', metrics.get('precision_macro', 0.0))),
+        'System Precision': float(metrics.get('system_precision', metrics.get('precision_micro', 0.0))),
+        'Average Recall': float(metrics.get('average_recall', metrics.get('recall_macro', 0.0))),
+        'System Recall': float(metrics.get('system_recall', metrics.get('recall_micro', 0.0))),
+        'Average F1': float(metrics.get('average_f1', metrics.get('f1_macro', 0.0))),
+        'System F1': float(metrics.get('system_f1', metrics.get('f1_micro', 0.0))),
+        'Average Error Rate': float(metrics.get('average_error_rate', metrics.get('error_rate', 0.0))),
+        'System Error Rate': float(metrics.get('system_error_rate', 0.0)),
+    }
+
+
+def compute_multiclass_monitor_loss(global_metrics):
+    """
+    Loss monitoring tambahan berbasis metrik multi-label.
+
+    Ini tidak dipakai untuk backward/optimisasi; hanya untuk grafik agar
+    performa klasifikasi multi-label bisa dipantau tanpa mengubah loss inti.
+    """
+    avg_acc = float(np.clip(global_metrics.get('Average Accuracy', 0.0), 0.0, 1.0))
+    avg_f1 = float(np.clip(global_metrics.get('Average F1', 0.0), 0.0, 1.0))
+    error_rate = float(np.clip(global_metrics.get('Average Error Rate', 1.0 - avg_acc), 0.0, 1.0))
+    return 0.5 * (error_rate + (1.0 - avg_f1))
+
+
+def update_best_metric_bundle(best_bundle, current_bundle):
+    for metric_name in best_bundle.keys():
+        best_bundle[metric_name]['per_class'] = [
+            max(best_value, current_value)
+            for best_value, current_value in zip(
+                best_bundle[metric_name]['per_class'],
+                current_bundle[metric_name]['per_class'],
+            )
+        ]
+        best_bundle[metric_name]['average'] = max(
+            best_bundle[metric_name]['average'],
+            current_bundle[metric_name]['average'],
+        )
+        best_bundle[metric_name]['system'] = max(
+            best_bundle[metric_name]['system'],
+            current_bundle[metric_name]['system'],
+        )
+
+
+def init_best_global_metrics():
+    return {
+        'Average Accuracy': 0.0,
+        'System Accuracy': 0.0,
+        'Average Precision': 0.0,
+        'System Precision': 0.0,
+        'Average Recall': 0.0,
+        'System Recall': 0.0,
+        'Average F1': 0.0,
+        'System F1': 0.0,
+        'Average Error Rate': float('inf'),
+        'System Error Rate': float('inf'),
+    }
+
+
+def update_best_global_metrics(best_metrics, current_metrics):
+    for metric_name, value in current_metrics.items():
+        if metric_name in {'Average Error Rate', 'System Error Rate'}:
+            best_metrics[metric_name] = min(best_metrics.get(metric_name, float('inf')), value)
+        else:
+            best_metrics[metric_name] = max(best_metrics.get(metric_name, 0.0), value)
+
+
+def _table_border(label_width, value_width, num_value_cols, fill='-'):
+    return "  +" + fill * (label_width + 2) + "+" + "+".join(
+        fill * (value_width + 2) for _ in range(num_value_cols)
+    ) + "+"
+
+
+def _table_row(label_width, value_width, label, values, average_value, system_value):
+    items = list(values) + [average_value, system_value]
+    cells = " | ".join(f"{item:>{value_width}.4f}" for item in items)
+    return f"  | {label:<{label_width}} | {cells} |"
+
+
+def log_metric_table(logger, title, class_names, metric_bundle):
+    label_width = 26
+    value_width = max(12, max(len(name) for name in class_names + ['AVERAGE', 'SISTEM']) + 2)
+    top = _table_border(label_width, value_width, len(class_names) + 2, '=')
+    mid = _table_border(label_width, value_width, len(class_names) + 2, '-')
+    header = (
+        f"  | {'METRIK':<{label_width}} | "
+        + " | ".join(f"{name.upper():>{value_width}}" for name in class_names)
+        + f" | {'AVERAGE':>{value_width}} | {'SISTEM':>{value_width}} |"
+    )
+
+    total_width = label_width + (value_width + 3) * (len(class_names) + 2) + 1
+    logger.info(top)
+    logger.info(f"  | {title:^{total_width}}|")
+    logger.info(top)
+    logger.info(header)
+    logger.info(mid)
+    for metric_name in metric_bundle.keys():
+        logger.info(
+            _table_row(
+                label_width,
+                value_width,
+                metric_name,
+                metric_bundle[metric_name]['per_class'],
+                metric_bundle[metric_name]['average'],
+                metric_bundle[metric_name]['system'],
+            )
+        )
+    logger.info(top)
+
+
+def log_global_metric_table(logger, title, metrics):
+    label_width = max(18, max(len(name) for name in metrics.keys()))
+    value_width = 12
+    top = "  +" + "=" * (label_width + 2) + "+" + "=" * (value_width + 2) + "+"
+    mid = "  +" + "-" * (label_width + 2) + "+" + "-" * (value_width + 2) + "+"
+
+    logger.info(top)
+    logger.info(f"  | {title:^{label_width + value_width + 5}} |")
+    logger.info(top)
+    logger.info(f"  | {'METRIK':<{label_width}} | {'GLOBAL':>{value_width}} |")
+    logger.info(mid)
+    for metric_name, value in metrics.items():
+        display_value = float(value)
+        if metric_name == 'Error Rate' and not np.isfinite(display_value):
+            display_value = 0.0
+        logger.info(f"  | {metric_name:<{label_width}} | {display_value:>{value_width}.4f} |")
+    logger.info(top)
+
+
+def ensure_metric_graph_dirs():
+    metric_dir = Config.GRAPHS_DIR / 'multi_label'
+    metric_dir.mkdir(parents=True, exist_ok=True)
+    return metric_dir
+
+
+def count_bbox_per_class(dataset, num_classes):
+    counts = {i: 0 for i in range(num_classes)}
+    total = 0
+    for anns in dataset.image_annotations.values():
+        for ann in anns:
+            if 'bbox' in ann and ann.get('area', 0) > 0:
+                idx = dataset.category_id_to_idx[ann['category_id']]
+                if idx < num_classes:
+                    counts[idx] += 1
+                    total += 1
+    return counts, total
+
+
+def print_dataset_summary(logger, train_ds, val_ds, test_ds, num_classes, cls_names):
+    sep = "=" * 70
+    tc, tt = count_bbox_per_class(train_ds, num_classes)
+    vc, vt = count_bbox_per_class(val_ds, num_classes)
+    ec, et = (
+        count_bbox_per_class(test_ds, num_classes)
+        if test_ds else ({i: 0 for i in range(num_classes)}, 0)
+    )
+    train_repeat = max(1, int(getattr(train_ds, 'repeat_factor', 1)))
+    val_repeat = max(1, int(getattr(val_ds, 'repeat_factor', 1)))
+    test_repeat = max(1, int(getattr(test_ds, 'repeat_factor', 1))) if test_ds else 1
+
+    logger.info(sep)
+    logger.info("  RINGKASAN DATASET")
+    logger.info(sep)
+    logger.info(
+        f"  {'Split':<10} {'Img Unik':>10} {'Img/Epoch':>10} "
+        f"{'BBox Asli':>12} {'BBox/Epoch':>12}"
+    )
+    logger.info(
+        f"  {'Train':<10} {len(train_ds.image_ids):>10,} {len(train_ds):>10,} "
+        f"{tt:>12,} {tt * train_repeat:>12,}"
+    )
+    logger.info(
+        f"  {'Val':<10} {len(val_ds.image_ids):>10,} {len(val_ds):>10,} "
+        f"{vt:>12,} {vt * val_repeat:>12,}"
+    )
+    logger.info(
+        f"  {'Test':<10} {len(test_ds.image_ids) if test_ds else 0:>10,} "
+        f"{(len(test_ds) if test_ds else 0):>10,} {et:>12,} {et * test_repeat:>12,}"
+    )
+    logger.info(sep)
+    logger.info("  BBOX ASLI PER KELAS")
+    logger.info(f"  {'Kelas':<15} {'Train':>8} {'Val':>8} {'Test':>8} {'Total':>8} {'Train/Epoch':>12}")
+    for i in range(num_classes):
+        name = cls_names[i].upper() if i < len(cls_names) else f"CLASS_{i}"
+        total_count = tc[i] + vc[i] + ec[i]
+        logger.info(
+            f"  {name:<15} {tc[i]:>8,} {vc[i]:>8,} {ec[i]:>8,} {total_count:>8,} {tc[i] * train_repeat:>12,}"
+        )
+    logger.info(sep + "\n")
+
+
+def print_class_balanced_sampler_summary(logger, sampler_report, cls_names):
+    sep = "=" * 70
+    if not sampler_report or not sampler_report.get('enabled', False):
+        logger.info(sep)
+        logger.info("  CLASS-BALANCED SAMPLER")
+        logger.info(sep)
+        logger.info("  Status            : Nonaktif")
+        logger.info(sep + "\n")
+        return
+
+    class_counts = sampler_report.get('class_counts', {})
+    multipliers = sampler_report.get('class_multipliers', [])
+    effective_targets = sampler_report.get('effective_targets', {})
+    mode = sampler_report.get('mode', 'max')
+    num_samples = int(sampler_report.get('num_samples', 0))
+
+    logger.info(sep)
+    logger.info("  CLASS-BALANCED SAMPLER")
+    logger.info(sep)
+    logger.info("  Status            : Aktif")
+    logger.info(f"  Weight Mode       : {mode}")
+    logger.info(f"  Num Samples/Epoch : {num_samples:,}")
+    logger.info(f"  {'Kelas':<15} {'BBox Asli':>10} {'Multiplier':>12} {'Target Efektif':>16}")
+    for cls_idx, cls_name in enumerate(cls_names):
+        raw_count = int(class_counts.get(cls_idx, 0))
+        multiplier = float(multipliers[cls_idx]) if cls_idx < len(multipliers) else 1.0
+        target = float(effective_targets.get(cls_idx, raw_count))
+        logger.info(
+            f"  {cls_name.upper():<15} {raw_count:>10,} {multiplier:>12.3f} {target:>16.1f}"
+        )
+    logger.info(sep + "\n")
+
+
+def print_model_config(logger, model, num_classes, image_size, batch_size, lr, epochs, device, use_amp, optimizer_name):
+    sep = "=" * 70
+
+    def num_params(module):
+        return sum(p.numel() for p in module.parameters())
+
+    logger.info(sep)
+    logger.info("  KONFIGURASI MODEL & TRAINING")
+    logger.info(sep)
+    logger.info(f"  Model Architecture: {model.__class__.__name__}")
+    logger.info(f"  Image Size        : {image_size}x{image_size}")
+    logger.info(f"  Num Classes       : {num_classes}")
+    logger.info(f"  Batch Size        : {batch_size}")
+    logger.info(f"  Learning Rate     : {lr}")
+    logger.info(f"  Epochs            : {epochs}")
+    logger.info(f"  Optimize          : {optimizer_name}")
+    logger.info(f"  Weight Decay      : {getattr(Config, 'WEIGHT_DECAY', 0.0)}")
+    if _normalize_optimizer_name(optimizer_name) == 'sgd_momentum':
+        logger.info(f"  Momentum          : {getattr(Config, 'SGD_MOMENTUM', 0.9)}")
+        logger.info(f"  Nesterov          : {getattr(Config, 'SGD_NESTEROV', False)}")
+    logger.info(f"  Scheduler         : {getattr(Config, 'LR_SCHEDULER', 'none')}")
+    logger.info(f"  Warmup Epochs     : {getattr(Config, 'WARMUP_EPOCHS', 0)}")
+    logger.info(f"  Grad Clip Norm    : {getattr(Config, 'GRAD_CLIP_NORM', 0.0)}")
+    logger.info(f"  Device            : {device}")
+    logger.info(f"  Mixed Precision   : {use_amp}")
+    logger.info(f"  cuDNN Benchmark   : {getattr(Config, 'CUDA_BENCHMARK', False)}")
+    logger.info(f"  TF32              : {getattr(Config, 'ALLOW_TF32', False)}")
+    logger.info(f"  Class Priority    : {getattr(Config, 'CLASS_PRIORITY_MODE', False)}")
+    logger.info(f"  Loss Objective    : class-oriented untuk semua epoch")
+    logger.info(f"  Loss Weights      : cls={Config.LAMBDA_CLASS:.2f} | bbox={Config.LAMBDA_BBOX:.2f} | obj={Config.LAMBDA_OBJ:.2f}")
+    logger.info(f"  Loss Type         : bbox={getattr(Config, 'BBOX_LOSS_TYPE', 'unknown')} | focal={getattr(Config, 'USE_FOCAL_LOSS', False)}")
+    logger.info(f"  Focal Params      : alpha={getattr(Config, 'FOCAL_ALPHA', 0.0)} | gamma={getattr(Config, 'FOCAL_GAMMA', 0.0)}")
+    logger.info(f"  IoU Assign        : pos={getattr(Config, 'IOU_THRESHOLD_POS', 0.0)} | neg={getattr(Config, 'IOU_THRESHOLD_NEG', 0.0)}")
+    logger.info(f"  Checkpoint Metric : {getattr(Config, 'CHECKPOINT_METRIC', 'mAP@0.50')}")
+    logger.info(f"  Metrics           : multi-label | mAP@0.50 | mAP@[0.50:0.95]")
+    logger.info(
+        f"  Inference Class   : conf={getattr(Config, 'CLASS_CONF_THRESHOLD', getattr(Config, 'CONF_THRESHOLD', 0.0))} | "
+        f"nms={getattr(Config, 'CLASS_NMS_IOU_THRESHOLD', getattr(Config, 'NMS_IOU_THRESHOLD', 0.0))} | "
+        f"max_det={getattr(Config, 'CLASS_MAX_DETECTIONS', getattr(Config, 'MAX_DETECTIONS', 0))}"
+    )
+    logger.info(
+        f"  Metric Class Eval : conf={getattr(Config, 'CLASS_METRIC_CONF_THRESHOLD', getattr(Config, 'CLASS_CONF_THRESHOLD', 0.0))} | "
+        f"nms={getattr(Config, 'CLASS_METRIC_NMS_IOU_THRESHOLD', getattr(Config, 'CLASS_NMS_IOU_THRESHOLD', 0.0))} | "
+        f"max_det={getattr(Config, 'CLASS_METRIC_MAX_DETECTIONS', getattr(Config, 'CLASS_MAX_DETECTIONS', 0))} | "
+        f"centerness={getattr(Config, 'CLASS_METRIC_USE_CENTERNESS', False)}"
+    )
+    logger.info(
+        f"  Inference Detect  : conf={getattr(Config, 'DET_CONF_THRESHOLD', getattr(Config, 'CONF_THRESHOLD', 0.0))} | "
+        f"nms={getattr(Config, 'DET_NMS_IOU_THRESHOLD', getattr(Config, 'NMS_IOU_THRESHOLD', 0.0))} | "
+        f"max_det={getattr(Config, 'DET_MAX_DETECTIONS', getattr(Config, 'MAX_DETECTIONS', 0))}"
+    )
+    logger.info(
+        f"  Score Mode        : class_cm="
+        f"{'class_x_centerness' if getattr(Config, 'USE_CENTERNESS_IN_SCORE', False) else 'class_only'} | "
+        f"map={'class_x_centerness' if getattr(Config, 'USE_CENTERNESS_IN_SCORE', False) else 'class_only'}"
+    )
+    logger.info(f"  Augment           : {getattr(Config, 'AUGMENT', False)}")
+    logger.info(f"  Aug Repeat        : {getattr(Config, 'AUGMENT_REPEAT_FACTOR', 1) if getattr(Config, 'AUGMENT', False) else 1}")
+    logger.info(
+        f"  Dataloader        : workers={getattr(Config, 'NUM_WORKERS', 0)} | "
+        f"pin_memory={getattr(Config, 'PIN_MEMORY', False)} | "
+        f"persistent={getattr(Config, 'PERSISTENT_WORKERS', False)}"
+    )
+    logger.info(
+        f"  Backbone Config   : {getattr(Config, 'BACKBONE_NAME', 'unknown')} | "
+        f"pretrained={getattr(Config, 'BACKBONE_PRETRAINED', False)} | "
+        f"source={getattr(Config, 'BACKBONE_PRETRAIN_SOURCE', 'imagenet')}"
+    )
+    if getattr(Config, 'BACKBONE_CUSTOM_WEIGHTS_PATH', None):
+        logger.info(f"  Backbone Weights  : {getattr(Config, 'BACKBONE_CUSTOM_WEIGHTS_PATH')}")
+    logger.info(
+        f"  Transformer       : dim={getattr(Config, 'TRANSFORMER_DIM', 0)} | "
+        f"heads={getattr(Config, 'TRANSFORMER_HEADS', 0)} | "
+        f"layers={getattr(Config, 'TRANSFORMER_LAYERS', 0)} | "
+        f"ff={getattr(Config, 'TRANSFORMER_FF_DIM', 0)} | "
+        f"dropout={getattr(Config, 'TRANSFORMER_DROPOUT', 0.0)}"
+    )
+    if hasattr(model, 'backbone'):
+        logger.info(f"  Backbone          : {num_params(model.backbone)/1e6:.2f}M")
+    elif hasattr(model, 'stage_p2'):
+        # MobileNetDetector: gunakan stage_p2 sebagai backbone
+        logger.info(f"  Backbone (P2)     : {num_params(model.stage_p2)/1e6:.2f}M")
+    logger.info(
+        f"  Stage P3/P4/P5    : "
+        f"{num_params(model.stage_p3)/1e6:.2f}M / "
+        f"{num_params(model.stage_p4)/1e6:.2f}M / "
+        f"{num_params(model.stage_p5)/1e6:.2f}M"
+    )
+    logger.info(
+        f"  FPN               : "
+        f"{(num_params(model.lat_p3) + num_params(model.lat_p4) + num_params(model.smooth_p3) + num_params(model.smooth_p4))/1e6:.2f}M"
+    )
+    logger.info(f"  Head              : {num_params(model.detection_head)/1e6:.2f}M")
+    logger.info(f"  Total Parameters  : {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    _trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    _frozen    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    logger.info(f"  Trainable         : {_trainable/1e6:.2f}M")
+    logger.info(f"  Frozen (Dikunci)  : {_frozen/1e6:.2f}M")
+    logger.info(sep + "\n")
+
+
+def _savefig(filename: str, output_dir: Path | None = None):
+    output_dir = output_dir or Config.GRAPHS_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output_dir / filename, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def _annotate_best_point(x_values, y_values, mode='max', text='Best Model', ax=None):
+    if not x_values or not y_values or len(x_values) != len(y_values):
+        return
+
+    y_array = np.asarray(y_values, dtype=float)
+    if y_array.size == 0 or np.all(~np.isfinite(y_array)):
+        return
+
+    best_idx = int(np.nanargmax(y_array) if mode == 'max' else np.nanargmin(y_array))
+    best_x = x_values[best_idx]
+    best_y = y_values[best_idx]
+    target_ax = ax or plt.gca()
+
+    target_ax.scatter([best_x], [best_y], s=18, c='black', zorder=6)
+
+    x_offset = 10 if best_idx < max(1, len(x_values) // 2) else -46
+    y_offset = -16 if best_y > float(np.nanmean(y_array)) else 12
+    target_ax.annotate(
+        f"{text}\n{best_y:.4f}",
+        xy=(best_x, best_y),
+        xytext=(x_offset, y_offset),
+        textcoords='offset points',
+        fontsize=7,
+        color='black',
+        arrowprops=dict(
+            arrowstyle='->',
+            color='black',
+            lw=0.7,
+            shrinkA=2,
+            shrinkB=2,
+        ),
+        bbox=dict(facecolor='white', edgecolor='none', alpha=0.75, pad=0.2),
+        zorder=7,
+    )
+
+
+def save_single_metric_plot(x_val, y_val, title, ylabel, fname, color, marker, mode='max', output_dir: Path | None = None):
+    if not x_val or len(x_val) != len(y_val):
+        return
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(x_val, y_val, color=color, marker=marker, linewidth=1.8, markersize=4)
+    _annotate_best_point(x_val, y_val, mode=mode)
+    plt.title(title)
+    plt.xlabel('Epoch')
+    plt.ylabel(ylabel)
+    plt.grid(True, alpha=0.7)
+    _savefig(fname, output_dir=output_dir)
+
+
+def build_dense_epoch_series(x_sparse, y_sparse):
+    if not x_sparse or len(x_sparse) != len(y_sparse):
+        return [], []
+
+    if len(x_sparse) == 1:
+        return list(x_sparse), list(y_sparse)
+
+    x_dense = list(range(int(x_sparse[0]), int(x_sparse[-1]) + 1))
+    y_dense = np.interp(x_dense, x_sparse, y_sparse).tolist()
+    return x_dense, y_dense
+
+
+def plot_dense_train_series(x_sparse, y_sparse, label, color, marker):
+    if not x_sparse or len(x_sparse) != len(y_sparse):
+        return [], []
+
+    x_dense, y_dense = build_dense_epoch_series(x_sparse, y_sparse)
+    if x_dense and len(x_dense) == len(y_dense):
+        plt.plot(x_dense, y_dense, label=label, color=color, linewidth=1.8)
+        plt.scatter(x_sparse, y_sparse, color=color, marker=marker, s=28, zorder=5)
+    return x_dense, y_dense
+
+
+def save_dual_metric_plot(
+    x_train,
+    y_train,
+    x_val,
+    y_val,
+    title,
+    ylabel,
+    fname,
+    train_color='royalblue',
+    val_color='tomato',
+    train_marker='s',
+    val_marker='o',
+    mode='max',
+    train_sparse_x=None,
+    train_sparse_y=None,
+    output_dir: Path | None = None,
+):
+    if (not x_train or len(x_train) != len(y_train)) and (not x_val or len(x_val) != len(y_val)):
+        return
+
+    plt.figure(figsize=(10, 5))
+    if x_train and len(x_train) == len(y_train):
+        sparse_x = train_sparse_x if train_sparse_x and len(train_sparse_x) == len(train_sparse_y or []) else x_train
+        sparse_y = train_sparse_y if train_sparse_y and len(train_sparse_y or []) == len(sparse_x) else y_train
+        plt.plot(x_train, y_train, label='Train', color=train_color, linewidth=1.8)
+        if sparse_x and len(sparse_x) == len(sparse_y):
+            plt.scatter(sparse_x, sparse_y, color=train_color, marker=train_marker, s=28, zorder=5)
+            _annotate_best_point(sparse_x, sparse_y, mode=mode, text='Best Train')
+        else:
+            _annotate_best_point(x_train, y_train, mode=mode, text='Best Train')
+    if x_val and len(x_val) == len(y_val):
+        plt.plot(x_val, y_val, label='Val', color=val_color, marker=val_marker, linewidth=1.8, markersize=4)
+        _annotate_best_point(x_val, y_val, mode=mode, text='Best Val')
+    plt.title(title)
+    plt.xlabel('Epoch')
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid(True, alpha=0.7)
+    _savefig(fname, output_dir=output_dir)
+
+
+def annotate_metric_series(series_list):
+    for x_values, y_values, mode in series_list:
+        _annotate_best_point(x_values, y_values, mode=mode)
+
+
+def _safe_metric_filename(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ('_', '-') else "_" for ch in name.lower())
+
+
+def get_focal_loss_display_text() -> str:
+    gamma = float(getattr(Config, 'FOCAL_GAMMA', 2.0))
+    alpha = getattr(Config, 'LOSS_CLASS_ALPHA', getattr(Config, 'FOCAL_ALPHA', 0.25))
+    return (
+        "Focal Loss (Lin et al., ICCV 2017)\n"
+        "FL(pt) = -(1 - pt)^gamma log(pt)\n"
+        f"gamma = {gamma:.2f} | alpha = {alpha}"
+    )
+
+
+def add_plot_note(ax, text: str, x: float = 0.02, y: float = 0.98) -> None:
+    if not text:
+        return
+    ax.text(
+        x,
+        y,
+        text,
+        transform=ax.transAxes,
+        ha='left',
+        va='top',
+        fontsize=9,
+        bbox=dict(boxstyle='round,pad=0.35', facecolor='white', edgecolor='gray', alpha=0.92),
+    )
+
+
+def build_lr_scheduler(optimizer):
+    scheduler_name = str(getattr(Config, 'LR_SCHEDULER', 'cosine')).strip().lower()
+    if scheduler_name in {'constant', 'fixed', 'none'}:
+        return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+    if scheduler_name == 'step':
+        return optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=max(1, int(getattr(Config, 'LR_STEP_SIZE', 30))),
+            gamma=float(getattr(Config, 'LR_GAMMA', 0.1)),
+        )
+    return optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, int(getattr(Config, 'EPOCHS', 1))),
+        eta_min=float(getattr(Config, 'LEARNING_RATE', 1e-4)) * 0.01,
+    )
+
+
+def _normalize_optimizer_name(name) -> str:
+    raw = str(name or 'adamw').strip().lower()
+    simplified = raw.replace('_', '').replace('-', '').replace(' ', '').replace('+', '')
+    if simplified in {'adamw'}:
+        return 'adamw'
+    if simplified in {'adam'}:
+        return 'adam'
+    if simplified in {'sgdmomentum', 'sgdwithmomentum', 'sgd'}:
+        return 'sgd_momentum'
+    if simplified in {'rmsprop'}:
+        return 'rmsprop'
+    if 'muon' in simplified:
+        return 'muon'
+    raise ValueError(
+        f"Config.OPTIMIZER_TYPE '{name}' tidak dikenali. Gunakan 'AdamW', 'Adam', 'RMSProp', atau 'SGD + momentum'."
+    )
+
+
+def get_optimizer_name() -> str:
+    optimizer_enabled = bool(getattr(Config, 'OPTIMIZER', True))
+    optimizer_type = getattr(Config, 'OPTIMIZER_TYPE', 'AdamW')
+    normalized = _normalize_optimizer_name(optimizer_type if optimizer_enabled else 'AdamW')
+    if normalized == 'sgd_momentum':
+        return 'SGD + momentum'
+    if normalized == 'rmsprop':
+        return 'RMSProp'
+    if normalized == 'adam':
+        return 'Adam'
+    if normalized == 'muon':
+        return 'Muon + MuSGD'
+    return 'AdamW'
+
+
+def build_optimizer(model):
+    param_groups = [
+        {
+            'params': [p for n, p in model.named_parameters() if 'backbone' in n],
+            'lr': Config.LEARNING_RATE * 0.1,
+        },
+        {
+            'params': [p for n, p in model.named_parameters() if 'backbone' not in n],
+            'lr': Config.LEARNING_RATE,
+        },
+    ]
+
+    optimizer_name = get_optimizer_name()
+    normalized = _normalize_optimizer_name(optimizer_name)
+
+    if normalized == 'sgd_momentum':
+        optimizer = optim.SGD(
+            param_groups,
+            momentum=float(getattr(Config, 'SGD_MOMENTUM', 0.9)),
+            weight_decay=Config.WEIGHT_DECAY,
+            nesterov=bool(getattr(Config, 'SGD_NESTEROV', False)),
+        )
+    elif normalized == 'rmsprop':
+        optimizer = optim.RMSprop(
+            param_groups,
+            alpha=float(getattr(Config, 'RMSPROP_ALPHA', 0.99)),
+            eps=float(getattr(Config, 'RMSPROP_EPS', 1e-8)),
+            weight_decay=Config.WEIGHT_DECAY,
+            momentum=float(getattr(Config, 'SGD_MOMENTUM', 0.0)),
+            centered=bool(getattr(Config, 'RMSPROP_CENTERED', False))
+        )
+    elif normalized == 'adam':
+        optimizer = optim.Adam(
+            param_groups,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+    else:
+        optimizer = optim.AdamW(
+            param_groups,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+    return optimizer, optimizer_name
+
+
+def save_loss_plot(x_tr, y_tr, x_val, y_val, title, ylabel, fname, output_dir: Path | None = None, note_text: str | None = None):
+    plt.figure(figsize=(10, 5))
+    if x_tr and len(x_tr) == len(y_tr):
+        plt.plot(x_tr, y_tr, label='Train', color='royalblue', linewidth=1.5)
+        _annotate_best_point(x_tr, y_tr, mode='min')
+    if x_val and len(x_val) == len(y_val):
+        plt.plot(x_val, y_val, label='Val', color='tomato', linewidth=1.5, marker='o', markersize=3)
+        _annotate_best_point(x_val, y_val, mode='min')
+    plt.title(title)
+    plt.xlabel('Epoch')
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid(True, alpha=0.5)
+    add_plot_note(plt.gca(), note_text or "")
+    _savefig(fname, output_dir=output_dir)
+
+
+def save_multiclass_classification_focus_plot(
+    x_tr,
+    train_cls_loss,
+    x_val,
+    val_cls_loss,
+    x_tr_metrics,
+    train_avg_acc,
+    val_avg_acc,
+    output_dir: Path | None = None,
+):
+    """Grafik fokus evaluasi cabang klasifikasi multi-label: loss vs average accuracy."""
+    if (not x_tr or len(x_tr) != len(train_cls_loss)) and (not x_val or len(x_val) != len(val_cls_loss)):
+        return
+
+    fig, ax_loss = plt.subplots(figsize=(10, 5))
+
+    if x_tr and len(x_tr) == len(train_cls_loss):
+        ax_loss.plot(x_tr, train_cls_loss, label='Train Classification Loss', color='royalblue', linewidth=1.8)
+        _annotate_best_point(x_tr, train_cls_loss, mode='min', text='Best Train Loss', ax=ax_loss)
+    if x_val and len(x_val) == len(val_cls_loss):
+        ax_loss.plot(
+            x_val,
+            val_cls_loss,
+            label='Val Classification Loss',
+            color='tomato',
+            linewidth=1.8,
+            marker='o',
+            markersize=4,
+        )
+        _annotate_best_point(x_val, val_cls_loss, mode='min', text='Best Val Loss', ax=ax_loss)
+
+    ax_loss.set_title('Multi-Label Classification Focus: Loss vs Average Accuracy')
+    ax_loss.set_xlabel('Epoch')
+    ax_loss.set_ylabel('Classification Loss')
+    ax_loss.grid(True, alpha=0.5)
+    add_plot_note(ax_loss, get_focal_loss_display_text(), x=0.02, y=0.96)
+
+    ax_acc = ax_loss.twinx()
+    train_acc_x_dense, train_acc_y_dense = build_dense_epoch_series(x_tr_metrics, train_avg_acc)
+    if train_acc_x_dense and len(train_acc_x_dense) == len(train_acc_y_dense):
+        ax_acc.plot(
+            train_acc_x_dense,
+            train_acc_y_dense,
+            label='Train Avg Accuracy',
+            color='seagreen',
+            linewidth=1.8,
+            linestyle='--',
+        )
+        ax_acc.scatter(x_tr_metrics, train_avg_acc, color='seagreen', marker='s', s=28, zorder=5)
+        _annotate_best_point(x_tr_metrics, train_avg_acc, mode='max', text='Best Train Acc', ax=ax_acc)
+    if x_val and len(x_val) == len(val_avg_acc):
+        ax_acc.plot(
+            x_val,
+            val_avg_acc,
+            label='Val Avg Accuracy',
+            color='mediumseagreen',
+            linewidth=1.8,
+            marker='s',
+            markersize=4,
+        )
+        _annotate_best_point(x_val, val_avg_acc, mode='max', text='Best Val Acc', ax=ax_acc)
+    ax_acc.set_ylabel('Average Accuracy')
+
+    loss_handles, loss_labels = ax_loss.get_legend_handles_labels()
+    acc_handles, acc_labels = ax_acc.get_legend_handles_labels()
+    ax_loss.legend(loss_handles + acc_handles, loss_labels + acc_labels, loc='center right')
+
+    fig.tight_layout()
+    _savefig('multiclass_classification_focus.png', output_dir=output_dir)
+
+
+def update_all_plots(
+    x_tr,
+    x_val,
+    h_tr_loss,
+    h_val_loss,
+    h_tr_bbox,
+    h_val_bbox,
+    h_tr_cls,
+    h_val_cls,
+    h_tr_obj,
+    h_val_obj,
+    x_tr_metrics,
+    h_tr_acc,
+    h_tr_acc_cls,
+    h_tr_prec,
+    h_tr_rec,
+    h_tr_f1,
+    h_tr_map50,
+    h_tr_map5095,
+    h_acc,
+    h_acc_cls,
+    h_prec,
+    h_rec,
+    h_f1,
+    h_map50,
+    h_map5095,
+    class_names,
+    num_classes,
+    output_dir: Path | None = None,
+):
+    x_tr_acc_dense, h_tr_acc_dense = build_dense_epoch_series(x_tr_metrics, h_tr_acc)
+    x_tr_prec_dense, h_tr_prec_dense = build_dense_epoch_series(x_tr_metrics, h_tr_prec)
+    x_tr_rec_dense, h_tr_rec_dense = build_dense_epoch_series(x_tr_metrics, h_tr_rec)
+    x_tr_f1_dense, h_tr_f1_dense = build_dense_epoch_series(x_tr_metrics, h_tr_f1)
+    x_tr_map50_dense, h_tr_map50_dense = build_dense_epoch_series(x_tr_metrics, h_tr_map50)
+    x_tr_map5095_dense, h_tr_map5095_dense = build_dense_epoch_series(x_tr_metrics, h_tr_map5095)
+
+    save_loss_plot(x_tr, h_tr_loss, x_val, h_val_loss, 'Total Loss', 'Loss', 'loss_total.png', output_dir=output_dir)
+    save_loss_plot(x_tr, h_tr_bbox, x_val, h_val_bbox, 'BBox Regression Loss', 'Loss', 'loss_bbox.png', output_dir=output_dir)
+    save_loss_plot(
+        x_tr,
+        h_tr_cls,
+        x_val,
+        h_val_cls,
+        'Classification Loss',
+        'Loss',
+        'loss_cls.png',
+        output_dir=output_dir,
+        note_text=get_focal_loss_display_text(),
+    )
+    save_loss_plot(x_tr, h_tr_obj, x_val, h_val_obj, 'Objectness/Centerness', 'Loss', 'loss_obj.png', output_dir=output_dir)
+
+    if x_val and len(x_val) == len(h_acc):
+        plt.figure(figsize=(10, 5))
+        if x_tr_acc_dense and len(x_tr_acc_dense) == len(h_tr_acc_dense):
+            plot_dense_train_series(x_tr_metrics, h_tr_acc, 'Train Accuracy', 'green', 's')
+        plt.plot(x_val, h_acc, label='Val Accuracy', color='limegreen', marker='s')
+        if x_tr_prec_dense and len(x_tr_prec_dense) == len(h_tr_prec_dense):
+            plot_dense_train_series(x_tr_metrics, h_tr_prec, 'Train Precision', 'royalblue', 'o')
+        plt.plot(x_val, h_prec, label='Val Precision', color='cornflowerblue', marker='o')
+        if x_tr_rec_dense and len(x_tr_rec_dense) == len(h_tr_rec_dense):
+            plot_dense_train_series(x_tr_metrics, h_tr_rec, 'Train Recall', 'darkorange', 'D')
+        plt.plot(x_val, h_rec, label='Val Recall', color='orange', marker='D')
+        if x_tr_f1_dense and len(x_tr_f1_dense) == len(h_tr_f1_dense):
+            plot_dense_train_series(x_tr_metrics, h_tr_f1, 'Train F1-Score', 'purple', '^')
+        plt.plot(x_val, h_f1, label='Val F1-Score', color='mediumpurple', marker='^')
+        annotate_metric_series([
+            (x_tr_metrics, h_tr_acc, 'max'),
+            (x_val, h_acc, 'max'),
+            (x_tr_metrics, h_tr_prec, 'max'),
+            (x_val, h_prec, 'max'),
+            (x_tr_metrics, h_tr_rec, 'max'),
+            (x_val, h_rec, 'max'),
+            (x_tr_metrics, h_tr_f1, 'max'),
+            (x_val, h_f1, 'max'),
+        ])
+        plt.title('Train vs Val Metrics')
+        plt.xlabel('Epoch')
+        plt.ylabel('Score')
+        plt.legend()
+        plt.grid(True, alpha=0.7)
+        _savefig('classification_metrics_graph.png', output_dir=output_dir)
+
+        save_dual_metric_plot(x_tr_acc_dense, h_tr_acc_dense, x_val, h_acc, 'Train vs Val Accuracy', 'Accuracy', 'accuracy_graph.png', 'green', 'limegreen', 's', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_acc, output_dir=output_dir)
+        save_dual_metric_plot(x_tr_prec_dense, h_tr_prec_dense, x_val, h_prec, 'Train vs Val Precision', 'Precision', 'precision_graph.png', 'royalblue', 'cornflowerblue', 'o', 's', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_prec, output_dir=output_dir)
+        save_dual_metric_plot(x_tr_rec_dense, h_tr_rec_dense, x_val, h_rec, 'Train vs Val Recall', 'Recall', 'recall_graph.png', 'darkorange', 'orange', 'D', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_rec, output_dir=output_dir)
+        save_dual_metric_plot(x_tr_f1_dense, h_tr_f1_dense, x_val, h_f1, 'Train vs Val F1-Score', 'F1-Score', 'f1_graph.png', 'purple', 'mediumpurple', '^', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_f1, output_dir=output_dir)
+
+    if x_val and h_acc_cls and len(h_acc_cls) == num_classes and len(x_val) == len(h_acc_cls[0]):
+        colors = ['green', 'royalblue', 'darkorange', 'purple', 'teal', 'crimson']
+        for c in range(num_classes):
+            class_label = class_names[c] if c < len(class_names) else f"class_{c}"
+            file_label = _safe_metric_filename(class_label)
+            class_x_dense, class_y_dense = build_dense_epoch_series(
+                x_tr_metrics,
+                h_tr_acc_cls[c] if h_tr_acc_cls and len(h_tr_acc_cls) > c else [],
+            )
+            save_dual_metric_plot(
+                class_x_dense,
+                class_y_dense,
+                x_val,
+                h_acc_cls[c],
+                f'Train vs Val Accuracy - {class_label}',
+                'Accuracy',
+                f'acc_{file_label}.png',
+                colors[c % len(colors)],
+                'black',
+                'o',
+                's',
+                train_sparse_x=x_tr_metrics,
+                train_sparse_y=h_tr_acc_cls[c] if h_tr_acc_cls and len(h_tr_acc_cls) > c else [],
+                output_dir=output_dir,
+            )
+
+    if x_val and len(x_val) == len(h_map50):
+        plt.figure(figsize=(10, 5))
+        if x_tr_map50_dense and len(x_tr_map50_dense) == len(h_tr_map50_dense):
+            plot_dense_train_series(x_tr_metrics, h_tr_map50, 'Train mAP@0.50', 'seagreen', 's')
+        plt.plot(x_val, h_map50, label='Val mAP@0.50', color='mediumseagreen', marker='s')
+        if x_tr_map5095_dense and len(x_tr_map5095_dense) == len(h_tr_map5095_dense):
+            plot_dense_train_series(x_tr_metrics, h_tr_map5095, 'Train mAP@[0.50:0.95]', 'teal', '^')
+        plt.plot(x_val, h_map5095, label='Val mAP@[0.50:0.95]', color='turquoise', marker='^')
+        annotate_metric_series([
+            (x_tr_metrics, h_tr_map50, 'max'),
+            (x_val, h_map50, 'max'),
+            (x_tr_metrics, h_tr_map5095, 'max'),
+            (x_val, h_map5095, 'max'),
+        ])
+        plt.title('Train vs Val mAP')
+        plt.xlabel('Epoch')
+        plt.ylabel('Score')
+        plt.legend()
+        plt.grid(True, alpha=0.7)
+        _savefig('map_graph.png', output_dir=output_dir)
+
+        save_dual_metric_plot(x_tr_map50_dense, h_tr_map50_dense, x_val, h_map50, 'Train vs Val mAP@0.50', 'mAP@0.50', 'map50_graph.png', 'seagreen', 'mediumseagreen', 's', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_map50, output_dir=output_dir)
+        save_dual_metric_plot(x_tr_map5095_dense, h_tr_map5095_dense, x_val, h_map5095, 'Train vs Val mAP@[0.50:0.95]', 'mAP@[0.50:0.95]', 'map5095_graph.png', 'teal', 'turquoise', '^', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_tr_map5095, output_dir=output_dir)
+
+
+def save_multiclass_per_class_plots(
+    x_train,
+    x_val,
+    class_names,
+    train_histories,
+    val_histories,
+    output_dir: Path | None = None,
+):
+    metric_meta = [
+        ('accuracy', 'Accuracy', 'green', 'limegreen'),
+        ('precision', 'Precision', 'royalblue', 'cornflowerblue'),
+        ('recall', 'Recall', 'darkorange', 'orange'),
+        ('f1', 'F1-Score', 'purple', 'mediumpurple'),
+    ]
+
+    for metric_key, metric_label, train_color, val_color in metric_meta:
+        train_by_class = train_histories.get(metric_key, [])
+        val_by_class = val_histories.get(metric_key, [])
+        for class_id, class_label in enumerate(class_names):
+            file_label = _safe_metric_filename(class_label)
+            train_series = train_by_class[class_id] if len(train_by_class) > class_id else []
+            val_series = val_by_class[class_id] if len(val_by_class) > class_id else []
+            train_x_dense, train_y_dense = build_dense_epoch_series(x_train, train_series)
+            save_dual_metric_plot(
+                train_x_dense,
+                train_y_dense,
+                x_val,
+                val_series,
+                f'Train vs Val {metric_label} - {class_label}',
+                metric_label,
+                f'{metric_key}_{file_label}.png',
+                train_color,
+                val_color,
+                'o',
+                's',
+                train_sparse_x=x_train,
+                train_sparse_y=train_series,
+                output_dir=output_dir,
+            )
+
+
+def update_multiclass_plots(
+    x_tr,
+    x_val,
+    loss_histories,
+    x_tr_metrics,
+    train_global_hist,
+    val_global_hist,
+    train_class_hist,
+    val_class_hist,
+    h_map50_train,
+    h_map5095_train,
+    h_map50_val,
+    h_map5095_val,
+    class_names,
+    output_dir: Path | None = None,
+):
+    save_loss_plot(x_tr, loss_histories['train_total'], x_val, loss_histories['val_total'], 'Total Loss', 'Loss', 'loss_total.png', output_dir=output_dir)
+    save_loss_plot(x_tr, loss_histories['train_bbox'], x_val, loss_histories['val_bbox'], 'BBox Regression Loss', 'Loss', 'loss_bbox.png', output_dir=output_dir)
+    save_loss_plot(
+        x_tr,
+        loss_histories['train_cls'],
+        x_val,
+        loss_histories['val_cls'],
+        'Classification Loss',
+        'Loss',
+        'loss_cls.png',
+        output_dir=output_dir,
+        note_text=get_focal_loss_display_text(),
+    )
+    save_loss_plot(x_tr, loss_histories['train_obj'], x_val, loss_histories['val_obj'], 'Objectness/Centerness', 'Loss', 'loss_obj.png', output_dir=output_dir)
+    x_tr_monitor_dense, h_tr_monitor_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist['monitor_loss'])
+    save_dual_metric_plot(
+        x_tr_monitor_dense,
+        h_tr_monitor_dense,
+        x_val,
+        val_global_hist['monitor_loss'],
+        'Train vs Val Multi-Label Monitoring Loss',
+        'Monitoring Loss',
+        'multiclass_monitor_loss.png',
+        'crimson',
+        'salmon',
+        '^',
+        'o',
+        mode='min',
+        train_sparse_x=x_tr_metrics,
+        train_sparse_y=train_global_hist['monitor_loss'],
+        output_dir=output_dir,
+    )
+    save_multiclass_classification_focus_plot(
+        x_tr=x_tr,
+        train_cls_loss=loss_histories['train_cls'],
+        x_val=x_val,
+        val_cls_loss=loss_histories['val_cls'],
+        x_tr_metrics=x_tr_metrics,
+        train_avg_acc=train_global_hist['avg_acc'],
+        val_avg_acc=val_global_hist['avg_acc'],
+        output_dir=output_dir,
+    )
+    aggregate_specs = [
+        ('avg_acc', 'Average Accuracy', 'average_accuracy_graph.png', 'green', 'limegreen', 's', 'o', 'max'),
+        ('sys_acc', 'System Accuracy', 'system_accuracy_graph.png', 'darkgreen', 'forestgreen', 's', 'o', 'max'),
+        ('avg_precision', 'Average Precision', 'average_precision_graph.png', 'royalblue', 'cornflowerblue', 'o', 's', 'max'),
+        ('sys_precision', 'System Precision', 'system_precision_graph.png', 'navy', 'steelblue', 'o', 's', 'max'),
+        ('avg_recall', 'Average Recall', 'average_recall_graph.png', 'darkorange', 'orange', 'D', 'o', 'max'),
+        ('sys_recall', 'System Recall', 'system_recall_graph.png', 'saddlebrown', 'peru', 'D', 'o', 'max'),
+        ('avg_f1', 'Average F1-Score', 'average_f1_graph.png', 'purple', 'mediumpurple', '^', 'o', 'max'),
+        ('sys_f1', 'System F1-Score', 'system_f1_graph.png', 'indigo', 'mediumorchid', '^', 'o', 'max'),
+    ]
+
+    if x_val and len(x_val) == len(val_global_hist['avg_acc']):
+        plt.figure(figsize=(11, 6))
+        for metric_key, metric_label, _, train_color, val_color, train_marker, val_marker, mode in aggregate_specs:
+            train_x_dense, train_y_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist[metric_key])
+            if train_x_dense and len(train_x_dense) == len(train_y_dense):
+                plot_dense_train_series(x_tr_metrics, train_global_hist[metric_key], f'Train {metric_label}', train_color, train_marker)
+            plt.plot(x_val, val_global_hist[metric_key], label=f'Val {metric_label}', color=val_color, marker=val_marker)
+            annotate_metric_series([
+                (x_tr_metrics, train_global_hist[metric_key], mode),
+                (x_val, val_global_hist[metric_key], mode),
+            ])
+        plt.title('Train vs Val Aggregate Metrics')
+        plt.xlabel('Epoch')
+        plt.ylabel('Score')
+        plt.legend(ncol=2)
+        plt.grid(True, alpha=0.7)
+        _savefig('classification_metrics_graph.png', output_dir=output_dir)
+
+        for metric_key, metric_label, filename, train_color, val_color, train_marker, val_marker, mode in aggregate_specs:
+            train_x_dense, train_y_dense = build_dense_epoch_series(x_tr_metrics, train_global_hist[metric_key])
+            save_dual_metric_plot(
+                train_x_dense,
+                train_y_dense,
+                x_val,
+                val_global_hist[metric_key],
+                f'Train vs Val {metric_label}',
+                metric_label,
+                filename,
+                train_color,
+                val_color,
+                train_marker,
+                val_marker,
+                mode=mode,
+                train_sparse_x=x_tr_metrics,
+                train_sparse_y=train_global_hist[metric_key],
+                output_dir=output_dir,
+            )
+
+    save_multiclass_per_class_plots(
+        x_train=x_tr_metrics,
+        x_val=x_val,
+        class_names=class_names,
+        train_histories=train_class_hist,
+        val_histories=val_class_hist,
+        output_dir=output_dir,
+    )
+
+    x_tr_map50_dense, h_tr_map50_dense = build_dense_epoch_series(x_tr_metrics, h_map50_train)
+    x_tr_map5095_dense, h_tr_map5095_dense = build_dense_epoch_series(x_tr_metrics, h_map5095_train)
+    if x_val and len(x_val) == len(h_map50_val):
+        plt.figure(figsize=(10, 5))
+        if x_tr_map50_dense and len(x_tr_map50_dense) == len(h_tr_map50_dense):
+            plot_dense_train_series(x_tr_metrics, h_map50_train, 'Train mAP@0.50', 'seagreen', 's')
+        plt.plot(x_val, h_map50_val, label='Val mAP@0.50', color='mediumseagreen', marker='s')
+        if x_tr_map5095_dense and len(x_tr_map5095_dense) == len(h_tr_map5095_dense):
+            plot_dense_train_series(x_tr_metrics, h_map5095_train, 'Train mAP@[0.50:0.95]', 'teal', '^')
+        plt.plot(x_val, h_map5095_val, label='Val mAP@[0.50:0.95]', color='turquoise', marker='^')
+        annotate_metric_series([
+            (x_tr_metrics, h_map50_train, 'max'),
+            (x_val, h_map50_val, 'max'),
+            (x_tr_metrics, h_map5095_train, 'max'),
+            (x_val, h_map5095_val, 'max'),
+        ])
+        plt.title('Train vs Val mAP')
+        plt.xlabel('Epoch')
+        plt.ylabel('Score')
+        plt.legend()
+        plt.grid(True, alpha=0.7)
+        _savefig('map_graph.png', output_dir=output_dir)
+
+        save_dual_metric_plot(x_tr_map50_dense, h_tr_map50_dense, x_val, h_map50_val, 'Train vs Val mAP@0.50', 'mAP@0.50', 'map50_graph.png', 'seagreen', 'mediumseagreen', 's', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_map50_train, output_dir=output_dir)
+        save_dual_metric_plot(x_tr_map5095_dense, h_tr_map5095_dense, x_val, h_map5095_val, 'Train vs Val mAP@[0.50:0.95]', 'mAP@[0.50:0.95]', 'map5095_graph.png', 'teal', 'turquoise', '^', 'o', train_sparse_x=x_tr_metrics, train_sparse_y=h_map5095_train, output_dir=output_dir)
+
+
+def create_comparison_images(images, targets, predictions, epoch, class_names):
+    save_dir = Config.TEST_RESULT_DIR
+    n = min(Config.TEST_VIS_SAMPLES, len(images), len(targets), len(predictions))
+    panel_gap = 2
+
+    def add_title_bar(image, title, bar_height=42):
+        h, w = image.shape[:2]
+        canvas = np.full((h + bar_height, w, 3), 255, dtype=np.uint8)
+        canvas[bar_height:, :] = image
+        cv2.putText(canvas, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40, 40, 40), 2, cv2.LINE_AA)
+        return canvas
+
+    def join_with_gap(panels, gap=2, gap_color=255):
+        if not panels:
+            return None
+        if len(panels) == 1:
+            return panels[0]
+
+        panel_height = panels[0].shape[0]
+        spacer = np.full((panel_height, gap, 3), gap_color, dtype=np.uint8)
+        combined_panels = []
+        for idx, panel in enumerate(panels):
+            combined_panels.append(panel)
+            if idx < len(panels) - 1:
+                combined_panels.append(spacer.copy())
+        return np.hstack(combined_panels)
+
+    for i in range(n):
+        img_tensor = images[i]
+        if isinstance(img_tensor, torch.Tensor):
+            img = img_tensor.cpu().numpy().transpose(1, 2, 0)
+        else:
+            img = np.asarray(img_tensor).transpose(1, 2, 0)
+        img = (img * np.array(Config.STD) + np.array(Config.MEAN)) * 255.0
+        img = np.clip(img, 0, 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        orig = img_bgr.copy()
+        gt_img = img_bgr.copy()
+        pred_img = img_bgr.copy()
+
+        tgt = targets[i] if isinstance(targets, list) else {
+            'boxes': targets['boxes'][i],
+            'labels': targets['labels'][i],
+        }
+
+        if len(tgt['boxes']) > 0:
+            gt_img = draw_bounding_boxes(
+                gt_img,
+                tgt['boxes'],
+                tgt['labels'],
+                class_names=class_names,
+                box_format='cxywh',
+            )
+
+        if len(predictions[i]['boxes']) > 0:
+            pred_img = draw_bounding_boxes(
+                pred_img,
+                predictions[i]['boxes'],
+                predictions[i]['classes'],
+                predictions[i]['scores'],
+                class_names=class_names,
+                box_format='xyxy',
+            )
+
+        orig = add_title_bar(orig, 'Original')
+        gt_img = add_title_bar(gt_img, 'Ground Truth')
+        pred_img = add_title_bar(pred_img, 'Prediction')
+
+        combined = join_with_gap([orig, gt_img, pred_img], gap=panel_gap)
+        cv2.imwrite(str(save_dir / f"compare_epoch{epoch}_{i}.jpg"), combined)
+
+
+def log_per_class_metrics_dual(
+    logger,
+    epoch,
+    class_names,
+    val_current_bundle,
+    val_best_bundle,
+    tr_current_bundle=None,
+    tr_best_bundle=None,
+):
+    sep = "=" * 90
+
+    logger.info(sep)
+    logger.info(f"  METRIK PER KELAS  |  Epoch {epoch:03d}")
+    logger.info(sep)
+
+    log_metric_table(logger, "VALIDASI (Epoch Ini)", class_names, val_current_bundle)
+    log_metric_table(logger, "VALIDASI (Best Sejauh Ini)", class_names, val_best_bundle)
+
+    if tr_current_bundle is not None:
+        log_metric_table(logger, "TRAIN (Epoch Ini)", class_names, tr_current_bundle)
+        log_metric_table(logger, "TRAIN (Best Sejauh Ini)", class_names, tr_best_bundle)
+
+    logger.info(sep + "\n")
+
+
+def log_multiclass_metrics_dual(
+    logger,
+    epoch,
+    class_names,
+    val_current_bundle,
+    val_best_bundle,
+    val_current_globals,
+    val_best_globals,
+    tr_current_bundle=None,
+    tr_best_bundle=None,
+    tr_current_globals=None,
+    tr_best_globals=None,
+):
+    sep = "=" * 90
+
+    logger.info(sep)
+    logger.info(f"  METRIK MULTI-LABEL  |  Epoch {epoch:03d}")
+    logger.info(sep)
+
+    log_metric_table(logger, "VALIDASI MULTI-LABEL (Best)", class_names, val_best_bundle)
+
+    if tr_current_bundle is not None and tr_current_globals is not None:
+        log_metric_table(logger, "TRAIN MULTI-LABEL (Best)", class_names, tr_best_bundle)
+
+    logger.info(sep + "\n")
+
+
+def print_final_summary(
+    logger,
+    class_names,
+    best_val_map50_epoch,
+    best_val_acc_epoch,
+    best_val_bundle,
+    best_tr_bundle,
+    best_val_multi_globals,
+    best_tr_multi_globals,
+    test_results,
+    final_train_loss,
+    final_val_loss,
+    total_epochs,
+    btt,
+    btt_e,
+    btb,
+    btb_e,
+    btc,
+    btc_e,
+    bto,
+    bto_e,
+    bvt,
+    bvt_e,
+    bvb,
+    bvb_e,
+    bvc,
+    bvc_e,
+    bvo,
+    bvo_e,
+):
+    sep = "=" * 90
+    sep2 = "-" * 90
+
+    logger.info("\n" + sep)
+    logger.info("  RINGKASAN AKHIR TRAINING")
+    logger.info(sep)
+    logger.info(f"  Best Val mAP@0.50        : {best_val_bundle['mAP@0.50']['average']:.4f}  (Epoch {best_val_map50_epoch})")
+    logger.info(f"  Best Val mAP@[0.50:0.95] : {best_val_bundle['mAP@[0.50:0.95]']['average']:.4f}")
+    logger.info(f"  Best Val Avg Accuracy    : {best_val_multi_globals['Average Accuracy']:.4f}  (Epoch {best_val_acc_epoch})")
+    logger.info(f"  Best Val Sys Accuracy    : {best_val_multi_globals['System Accuracy']:.4f}")
+    logger.info(f"  Best Val Avg Precision   : {best_val_multi_globals['Average Precision']:.4f}")
+    logger.info(f"  Best Val Sys Precision   : {best_val_multi_globals['System Precision']:.4f}")
+    logger.info(f"  Best Val Avg Recall      : {best_val_multi_globals['Average Recall']:.4f}")
+    logger.info(f"  Best Val Sys Recall      : {best_val_multi_globals['System Recall']:.4f}")
+    logger.info(f"  Best Val Avg F1          : {best_val_multi_globals['Average F1']:.4f}")
+    logger.info(f"  Best Val Sys F1          : {best_val_multi_globals['System F1']:.4f}")
+    logger.info(sep2)
+
+    log_metric_table(logger, "BEST VALIDASI MULTI-LABEL", class_names, best_val_bundle)
+    logger.info(sep2)
+
+    log_metric_table(logger, "BEST TRAIN MULTI-LABEL", class_names, best_tr_bundle)
+    logger.info(sep2)
+
+    test_bundle = test_results['multi_bundle']
+    test_multi_globals = test_results['multi_globals']
+
+    logger.info("  TEST GLOBAL")
+    logger.info(
+        f"  Test mAP@0.50={test_bundle['mAP@0.50']['average']:.4f} | "
+        f"mAP@[0.50:0.95]={test_bundle['mAP@[0.50:0.95]']['average']:.4f} | "
+        f"AvgAccMultiLabel={test_multi_globals['Average Accuracy']:.4f} | "
+        f"SysAcc={test_multi_globals['System Accuracy']:.4f} | "
+        f"SysPrec={test_multi_globals['System Precision']:.4f} | "
+        f"SysRec={test_multi_globals['System Recall']:.4f} | "
+        f"SysF1={test_multi_globals['System F1']:.4f}"
+    )
+    log_metric_table(logger, "TEST PER KELAS MULTI-LABEL", class_names, test_bundle)
+    logger.info(sep2)
+
+    logger.info("  BEST LOSS")
+    logger.info(f"  {'Komponen':<28} {'Train':>12} {'Epoch':>8} {'Val':>12} {'Epoch':>8}")
+    logger.info(f"  {'-'*28} {'-'*12} {'-'*8} {'-'*12} {'-'*8}")
+    logger.info(f"  {'Total':<28} {btt:>12.4f} {btt_e:>8} {bvt:>12.4f} {bvt_e:>8}")
+    logger.info(f"  {'BBox/Regression':<28} {btb:>12.4f} {btb_e:>8} {bvb:>12.4f} {bvb_e:>8}")
+    logger.info(f"  {'Classification':<28} {btc:>12.4f} {btc_e:>8} {bvc:>12.4f} {bvc_e:>8}")
+    logger.info(f"  {'Objectness':<28} {bto:>12.4f} {bto_e:>8} {bvo:>12.4f} {bvo_e:>8}")
+    logger.info(sep2)
+
+    gap = final_train_loss - final_val_loss
+    logger.info(f"  Final Train Loss : {final_train_loss:.4f}  |  Final Val Loss: {final_val_loss:.4f}")
+    logger.info(
+        f"  Gap (Train-Val)  : {gap:+.4f}  -> "
+        + ("GOOD FIT" if abs(gap) < 0.05 else ("VAL > TRAIN (data shift?)" if gap < -0.05 else "TRAIN << VAL (overfitting?)"))
+    )
+    logger.info(sep + "\n")
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, scaler, device, epoch, logger=None):
+    model.train()
+    if hasattr(criterion, 'set_epoch'):
+        criterion.set_epoch(epoch)
+    tl = tb = tc = to = 0.0
+    n = 0
+
+    pbar = tqdm(
+        dataloader,
+        desc=f"Train E-{epoch:03d}",
+        bar_format='{desc:<14} |{bar:28}| {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}',
+    )
+
+    for batch_idx, (images, targets) in enumerate(pbar):
+        batch_name = f"Train E-{epoch:03d} B-{batch_idx + 1:04d}"
+
+        if Config.STRICT_TARGET_VALIDATION:
+            targets = sanitize_targets(
+                targets,
+                num_classes=Config.NUM_CLASSES,
+                image_size=Config.IMAGE_SIZE,
+                logger=logger,
+                batch_name=batch_name,
+            )
+
+        try:
+            images = images.to(device, non_blocking=True)
+            with autocast(device_type='cuda', enabled=Config.USE_AMP):
+                outputs = model(images)
+                losses = criterion(outputs, targets)
+                loss = losses['total_loss']
+
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss terdeteksi: {loss.item()}")
+
+            # BUG FIX: Cegah gradient explosion dengan me-skip batch yang loss-nya tidak wajar
+            if loss.item() > 20.0:
+                if logger is not None:
+                    logger.warning(f"⚠️ {batch_name} Loss meledak (L_Tot={loss.item():.3f}). Batch di-skip untuk melindungi bobot model.")
+                optimizer.zero_grad(set_to_none=True)
+                # Lewati update scaler & optimizer
+            else:
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=float(getattr(Config, 'GRAD_CLIP_NORM', 0.0)),
+                )
+                scaler.step(optimizer)
+                scaler.update()
+        except RuntimeError as exc:
+            cleanup_cuda_after_error()
+            if logger is not None:
+                logger.error(
+                    "%s gagal diproses | image_ids=%s | error=%s",
+                    batch_name,
+                    targets.get('image_ids', []),
+                    exc,
+                )
+            raise
+
+        tl += loss.item()
+        tb += losses['bbox_loss'].item()
+        tc += losses['class_loss'].item()
+        to += losses['obj_loss'].item()
+        n += 1
+
+        pbar.set_postfix(
+            lr=f"{optimizer.param_groups[0]['lr']:.6f}",
+            L_Tot=f"{loss.item():.3f}",
+            L_Box=f"{losses['bbox_loss'].item():.3f}",
+            L_Cls=f"{losses['class_loss'].item():.3f}",
+        )
+
+    n = max(1, n)
+    return {
+        'total_loss': tl / n,
+        'bbox_loss': tb / n,
+        'class_loss': tc / n,
+        'obj_loss': to / n,
+    }
+
+
+def _chunked_map(preds, tgts, num_classes, iou_thresholds, chunk=150):
+    total = len(preds)
+    if total == 0:
+        results = {'mAP@0.50': 0.0, 'mAP@[0.5:0.95]': 0.0}
+        for thr in iou_thresholds:
+            for cls_id in range(num_classes):
+                results[f'AP@{thr:.2f}_class_{cls_id}'] = 0.0
+        return results
+
+    if total <= chunk:
+        try:
+            return calculate_map(preds, tgts, num_classes=num_classes, iou_thresholds=iou_thresholds)
+        except Exception:
+            results = {'mAP@0.50': 0.0, 'mAP@[0.5:0.95]': 0.0}
+            for thr in iou_thresholds:
+                for cls_id in range(num_classes):
+                    results[f'AP@{thr:.2f}_class_{cls_id}'] = 0.0
+            return results
+
+    per_threshold = {thr: [] for thr in iou_thresholds}
+    per_class = {thr: {cls_id: [] for cls_id in range(num_classes)} for thr in iou_thresholds}
+
+    for chunk_idx in range((total + chunk - 1) // chunk):
+        start = chunk_idx * chunk
+        end = min((chunk_idx + 1) * chunk, total)
+        try:
+            part = calculate_map(preds[start:end], tgts[start:end], num_classes=num_classes, iou_thresholds=iou_thresholds)
+            for thr in iou_thresholds:
+                per_threshold[thr].append(part.get(f'mAP@{thr:.2f}', 0.0))
+                for cls_id in range(num_classes):
+                    per_class[thr][cls_id].append(part.get(f'AP@{thr:.2f}_class_{cls_id}', 0.0))
+        except Exception:
+            for thr in iou_thresholds:
+                per_threshold[thr].append(0.0)
+                for cls_id in range(num_classes):
+                    per_class[thr][cls_id].append(0.0)
+        gc.collect()
+
+    results = {}
+    for thr in iou_thresholds:
+        results[f'mAP@{thr:.2f}'] = float(np.mean(per_threshold[thr]))
+        for cls_id in range(num_classes):
+            results[f'AP@{thr:.2f}_class_{cls_id}'] = float(np.mean(per_class[thr][cls_id]))
+    if len(iou_thresholds) > 1:
+        results['mAP@[0.5:0.95]'] = float(np.mean([results[f'mAP@{thr:.2f}'] for thr in iou_thresholds]))
+    return results
+
+
+@torch.no_grad()
+def evaluate(
+    model,
+    dataloader,
+    criterion,
+    device,
+    epoch,
+    label_prefix="Val",
+    collect_samples=False,
+    logger=None,
+    show_progress=True,
+):
+    model.eval()
+    if hasattr(criterion, 'set_epoch'):
+        criterion.set_epoch(epoch)
+    tl = tb = tc = to = 0.0
+    n = 0
+    all_class_preds = []
+    all_det_preds = []
+    all_tgts = []
+    sample_imgs = []
+    sample_tgts = []
+
+    pbar = tqdm(
+        dataloader,
+        desc=f"{label_prefix} E-{epoch:03d}",
+        bar_format='{desc:<14} |{bar:28}| {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}',
+        disable=not show_progress,
+    )
+
+    for idx, (images, targets) in enumerate(pbar):
+        batch_name = f"{label_prefix} E-{epoch:03d} B-{idx + 1:04d}"
+        if Config.STRICT_TARGET_VALIDATION:
+            targets = sanitize_targets(
+                targets,
+                num_classes=Config.NUM_CLASSES,
+                image_size=Config.IMAGE_SIZE,
+                logger=logger,
+                batch_name=batch_name,
+            )
+
+        images = images.to(device, non_blocking=True)
+        with autocast(device_type='cuda', enabled=Config.USE_AMP):
+            outputs = model(images)
+            losses = criterion(outputs, targets)
+
+        tl += losses['total_loss'].item()
+        tb += losses['bbox_loss'].item()
+        tc += losses['class_loss'].item()
+        to += losses['obj_loss'].item()
+        n += 1
+
+        class_detections = model.get_class_oriented_detections(
+            images,
+            conf_threshold=getattr(Config, 'CLASS_METRIC_CONF_THRESHOLD', Config.CLASS_CONF_THRESHOLD),
+            nms_iou_threshold=getattr(Config, 'CLASS_METRIC_NMS_IOU_THRESHOLD', Config.CLASS_NMS_IOU_THRESHOLD),
+            max_detections=getattr(Config, 'CLASS_METRIC_MAX_DETECTIONS', Config.CLASS_MAX_DETECTIONS),
+            use_centerness_in_score=getattr(Config, 'CLASS_METRIC_USE_CENTERNESS', False),
+            outputs=outputs,
+        )
+        det_detections = model.get_detections(
+            images,
+            conf_threshold=Config.DET_CONF_THRESHOLD,
+            nms_iou_threshold=Config.DET_NMS_IOU_THRESHOLD,
+            max_detections=Config.DET_MAX_DETECTIONS,
+            outputs=outputs,
+        )
+
+        for class_det, det_det, boxes, labels in zip(class_detections, det_detections, targets['boxes'], targets['labels']):
+            all_class_preds.append({
+                'boxes': class_det['boxes'].cpu(),
+                'scores': class_det['scores'].cpu(),
+                'classes': class_det['classes'].cpu(),
+            })
+            all_det_preds.append({
+                'boxes': det_det['boxes'].cpu(),
+                'scores': det_det['scores'].cpu(),
+                'classes': det_det['classes'].cpu(),
+            })
+            all_tgts.append({
+                'boxes': boxes.cpu(),
+                'labels': labels.cpu(),
+            })
+
+        if collect_samples and len(sample_imgs) < Config.TEST_VIS_SAMPLES:
+            remaining = Config.TEST_VIS_SAMPLES - len(sample_imgs)
+            batch_take = min(remaining, len(targets['boxes']))
+            sample_imgs.extend([img.cpu().clone() for img in images[:batch_take]])
+            sample_tgts.extend(
+                [{'boxes': b.cpu(), 'labels': l.cpu()} for b, l in zip(targets['boxes'][:batch_take], targets['labels'][:batch_take])]
+            )
+
+        del images, outputs, class_detections, det_detections
+        if getattr(Config, 'EMPTY_CACHE_PER_EVAL_BATCH', False):
+            torch.cuda.empty_cache()
+            gc.collect()
+        if show_progress:
+            pbar.set_postfix(
+                L_Tot=f"{losses['total_loss'].item():.3f}",
+                L_Box=f"{losses['bbox_loss'].item():.3f}",
+                L_Cls=f"{losses['class_loss'].item():.3f}",
+            )
+
+    n = max(1, n)
+    avg_losses = {
+        'total_loss': tl / n,
+        'bbox_loss': tb / n,
+        'class_loss': tc / n,
+        'obj_loss': to / n,
+    }
+
+    multiclass_metrics = calculate_multiclass_metrics(all_class_preds, all_tgts, Config.NUM_CLASSES)
+    map_metrics = _chunked_map(all_det_preds, all_tgts, Config.NUM_CLASSES, MAP_IOU_THRESHOLDS)
+    metrics = {
+        'val_loss': avg_losses['class_loss'],
+        'val_loss_total': avg_losses['total_loss'],
+        'val_loss_cls': avg_losses['class_loss'],
+        'val_loss_bbox': avg_losses['bbox_loss'],
+        'val_loss_obj': avg_losses['obj_loss'],
+        **multiclass_metrics,
+        **map_metrics,
+    }
+    return metrics, avg_losses, all_class_preds, all_det_preds, all_tgts, sample_imgs, sample_tgts
+
+
+def _extract_per_class(class_metrics, num_classes):
+    acc = list(class_metrics.get('accuracy_per_class', np.zeros(num_classes))[:num_classes])
+    prec = list(class_metrics.get('precision_per_class', np.zeros(num_classes))[:num_classes])
+    rec = list(class_metrics.get('recall_per_class', np.zeros(num_classes))[:num_classes])
+    f1 = list(class_metrics.get('f1_per_class', np.zeros(num_classes))[:num_classes])
+    return acc, prec, rec, f1
+
+
+def save_checkpoint(model, optimizer, epoch, metrics, fname=None, scheduler=None, scaler=None, train_state=None):
+    fname = fname or f'checkpoint_epoch_{epoch}.pth'
+    path = Config.CHECKPOINT_DIR / fname
+    payload = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'optimizer_name': get_optimizer_name(),
+        'metrics': metrics,
+    }
+    if scheduler is not None:
+        payload['scheduler_state_dict'] = scheduler.state_dict()
+    if scaler is not None:
+        payload['scaler_state_dict'] = scaler.state_dict()
+    if train_state is not None:
+        payload['train_state'] = train_state
+    torch.save(payload, path)
+    return path
+
+
+def save_confusion_matrix_bundle(
+    class_preds,
+    det_preds,
+    tgts,
+    class_names,
+    metric_graph_dir,
+    file_tag,
+    iou_threshold=0.5,
+):
+    class_filename = f'confusion_matrix_class_{file_tag}.png'
+    detection_filename = f'confusion_matrix_detection_{file_tag}.png'
+
+    generate_confusion_matrix(
+        class_preds,
+        tgts,
+        Config.NUM_CLASSES,
+        class_names=class_names,
+        fname=metric_graph_dir / class_filename,
+    )
+    generate_detection_confusion_matrix(
+        det_preds,
+        tgts,
+        Config.NUM_CLASSES,
+        class_names=class_names,
+        iou_threshold=iou_threshold,
+        fname=metric_graph_dir / detection_filename,
+    )
+
+
+def run_test_phase(model, criterion, device, class_names, val_tf, logger, epoch_label, checkpoint_path: Path | None = None):
+    test_multi_bundle = init_metric_bundle(Config.NUM_CLASSES, MULTI_PER_CLASS_ROW_ORDER)
+    test_multi_globals = init_best_global_metrics()
+    metric_graph_dir = ensure_metric_graph_dirs()
+
+    try:
+        from torch.utils.data import DataLoader
+        from data.utils import collate_fn
+
+        test_ds_final = ObjectDetectionDataset(
+            Config.TEST_IMAGES,
+            Config.TEST_ANNOTATIONS,
+            transform=val_tf,
+            image_size=Config.IMAGE_SIZE,
+            repeat_factor=1,
+        )
+        test_loader = DataLoader(
+            test_ds_final,
+            batch_size=min(Config.BATCH_SIZE, 4),
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn,
+        )
+
+        if checkpoint_path is not None:
+            ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt['model_state_dict'])
+
+        logger.info(
+            f"\n  Mengevaluasi pada test set "
+            f"(checkpoint: {checkpoint_path if checkpoint_path is not None else 'model saat ini'})..."
+        )
+        test_metrics, _, test_class_preds, test_det_preds, test_tgts, sample_imgs, sample_tgts_list = evaluate(
+            model,
+            test_loader,
+            criterion,
+            device,
+            epoch_label,
+            label_prefix="Test",
+            collect_samples=True,
+            logger=logger,
+        )
+
+        test_multi_bundle = extract_multiclass_bundle(test_metrics, Config.NUM_CLASSES)
+        test_multi_globals = extract_multiclass_global_metrics(test_metrics)
+
+        logger.info(
+            f"  Test mAP@0.50={test_multi_bundle['mAP@0.50']['average']:.4f} | "
+            f"mAP@[0.50:0.95]={test_multi_bundle['mAP@[0.50:0.95]']['average']:.4f} | "
+            f"AvgAccMultiLabel={test_multi_globals['Average Accuracy']:.4f} | "
+            f"SysAcc={test_multi_globals['System Accuracy']:.4f} | "
+            f"Precision={test_multi_globals['System Precision']:.4f} | "
+            f"Recall={test_multi_globals['System Recall']:.4f} | "
+            f"F1={test_multi_globals['System F1']:.4f}"
+        )
+
+        generate_confusion_matrix(
+            test_class_preds,
+            test_tgts,
+            Config.NUM_CLASSES,
+            class_names=class_names,
+            fname=metric_graph_dir / 'confusion_matrix_class_test.png',
+        )
+        generate_detection_confusion_matrix(
+            test_det_preds,
+            test_tgts,
+            Config.NUM_CLASSES,
+            class_names=class_names,
+            iou_threshold=0.5,
+            fname=metric_graph_dir / 'confusion_matrix_detection_test.png',
+        )
+
+        if len(sample_imgs) > 0:
+            create_comparison_images(
+                sample_imgs,
+                sample_tgts_list,
+                test_class_preds[:len(sample_imgs)],
+                epoch_label,
+                class_names,
+            )
+            logger.info(f"  Gambar perbandingan disimpan di: {Config.TEST_RESULT_DIR}")
+
+    except Exception as exc:
+        import traceback
+        logger.error(f"Error fase Testing: {exc}\n{traceback.format_exc()}")
+
+    return {
+        'multi_bundle': test_multi_bundle,
+        'multi_globals': test_multi_globals,
+    }
+
+
+def build_detector():
+    """
+    Factory function untuk memilih model detector berdasarkan Config.MODEL_TYPE.
+
+    Pilihan:
+      - "hybrid"    : CNN-Transformer Hybrid (Vikhe et al., 2025) — model utama
+      - "plain_cnn" : Plain CNN baseline (LeCun et al., 1998)
+      - "resnet"    : ResNet-18 murni (He et al., CVPR 2016)
+      - "vgg16"     : VGG-16-BN murni (Simonyan & Zisserman, ICLR 2015)
+      - "mobilenet" : MobileNetV2 ringan (Sandler et al., CVPR 2018)
+    """
+    model_type = getattr(Config, 'MODEL_TYPE', 'hybrid').lower().strip()
+
+    common_kwargs = dict(
+        num_classes=Config.NUM_CLASSES,
+        image_size=Config.IMAGE_SIZE,
+        transformer_dim=Config.TRANSFORMER_DIM,
+        transformer_heads=Config.TRANSFORMER_HEADS,
+        transformer_layers=Config.TRANSFORMER_LAYERS,
+    )
+
+    if model_type == 'hybrid':
+        return HybridDetector(**common_kwargs)
+    elif model_type == 'plain_cnn':
+        return PlainCNNDetector(**common_kwargs)
+    elif model_type == 'resnet':
+        return ResNetDetector(**common_kwargs)
+    elif model_type == 'vgg16':
+        return VGGDetector(**common_kwargs)
+    elif model_type == 'mobilenet':
+        from models.mobilenet_detector import MobileNetDetector
+        return MobileNetDetector(**common_kwargs)
+    else:
+        raise ValueError(
+            f"MODEL_TYPE '{model_type}' tidak dikenal. "
+            f"Pilihan: hybrid, plain_cnn, resnet, vgg16, mobilenet"
+        )
+
+
+def train(args):
+    if getattr(args, 'vis_samples', None) is not None:
+        Config.TEST_VIS_SAMPLES = int(args.vis_samples)
+
+    test_only_checkpoint = None
+    if getattr(args, 'test_only', False):
+        test_only_source = getattr(args, 'checkpoint', None) or getattr(args, 'resume', None)
+        test_only_checkpoint = resolve_evaluation_checkpoint(test_only_source) if test_only_source else None
+        if test_only_checkpoint is None:
+            raise ValueError("Mode --test-only membutuhkan --checkpoint atau --resume yang mengarah ke run/checkpoint.")
+
+    resume_checkpoint = resolve_resume_checkpoint(getattr(args, 'resume', None)) if not getattr(args, 'test_only', False) else None
+    active_checkpoint = test_only_checkpoint or resume_checkpoint
+    run_dir = setup_run(active_checkpoint)
+    logger = setup_logging()
+
+    logger.info("=" * 70)
+    if getattr(args, 'test_only', False):
+        logger.info(f"  TEST ONLY       |  Run: {run_dir.name}")
+        logger.info(f"  Checkpoint      : {test_only_checkpoint}")
+    elif resume_checkpoint is not None:
+        logger.info(f"  RESUME TRAINING |  Run: {run_dir.name}")
+        logger.info(f"  Resume From     : {resume_checkpoint}")
+    else:
+        logger.info(f"  MULAI TRAINING  |  Run: {run_dir.name}")
+    logger.info(f"  Output Dir: {run_dir.resolve()}")
+    logger.info("=" * 70)
+
+    device = Config.DEVICE
+    if device.type == 'cuda' and Config.CUDA_DEBUG_SYNC:
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+        logger.warning("CUDA debug sync aktif: CUDA_LAUNCH_BLOCKING=1. Training akan lebih lambat tetapi stacktrace lebih akurat.")
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = bool(getattr(Config, 'CUDA_BENCHMARK', True))
+        torch.backends.cudnn.allow_tf32 = bool(getattr(Config, 'ALLOW_TF32', True))
+        if hasattr(torch.backends.cuda, 'matmul'):
+            torch.backends.cuda.matmul.allow_tf32 = bool(getattr(Config, 'ALLOW_TF32', True))
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+
+    tr_tf = get_train_transforms(
+        Config.IMAGE_SIZE,
+        Config.MEAN,
+        Config.STD,
+        augment=Config.AUGMENT,
+        median_blur_prob=Config.MEDIAN_BLUR_PROB,
+        median_blur_limit=Config.MEDIAN_BLUR_LIMIT,
+        horizontal_flip_prob=Config.HORIZONTAL_FLIP_PROB,
+        vertical_flip_prob=Config.VERTICAL_FLIP_PROB,
+        rotate_limit=Config.ROTATE_LIMIT,
+        rotate_prob=Config.ROTATE_PROB,
+        random_resized_crop_prob=Config.RANDOM_RESIZED_CROP_PROB,
+        random_resized_crop_scale=Config.RANDOM_RESIZED_CROP_SCALE,
+        shift_scale_rotate_prob=Config.SHIFT_SCALE_ROTATE_PROB,
+        shift_limit=Config.SHIFT_LIMIT,
+        scale_limit=Config.SCALE_LIMIT,
+        color_jitter_prob=Config.COLOR_JITTER_PROB,
+        color_jitter_brightness=Config.COLOR_JITTER_BRIGHTNESS,
+        color_jitter_contrast=Config.COLOR_JITTER_CONTRAST,
+        color_jitter_saturation=Config.COLOR_JITTER_SATURATION,
+        color_jitter_hue=Config.COLOR_JITTER_HUE,
+        random_brightness_contrast_prob=Config.RANDOM_BRIGHTNESS_CONTRAST_PROB,
+        clahe_prob=Config.CLAHE_PROB,
+    )
+    val_tf = get_val_transforms(Config.IMAGE_SIZE, Config.MEAN, Config.STD)
+
+    def _build_dataset(image_dir, annotation_file, transform, repeat_factor=1):
+        return ObjectDetectionDataset(
+            image_dir,
+            annotation_file,
+            transform=transform,
+            image_size=Config.IMAGE_SIZE,
+            repeat_factor=repeat_factor,
+        )
+
+    train_ds = _build_dataset(
+        Config.TRAIN_IMAGES,
+        Config.TRAIN_ANNOTATIONS,
+        tr_tf,
+        repeat_factor=Config.AUGMENT_REPEAT_FACTOR if Config.AUGMENT else 1,
+    )
+
+    val_source_name = "val2017"
+    try:
+        val_ds = _build_dataset(
+            Config.VAL_IMAGES,
+            Config.VAL_ANNOTATIONS,
+            val_tf,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Validasi utama gagal dimuat dari %s + %s: %s",
+            Config.VAL_IMAGES,
+            Config.VAL_ANNOTATIONS,
+            exc,
+        )
+        logger.warning(
+            "Menggunakan split test2017 sebagai fallback validasi agar training tetap berjalan."
+        )
+        val_ds = _build_dataset(
+            Config.TEST_IMAGES,
+            Config.TEST_ANNOTATIONS,
+            val_tf,
+        )
+        val_source_name = "test2017 (fallback validasi)"
+
+    test_ds = None
+    try:
+        test_ds = _build_dataset(
+            Config.TEST_IMAGES,
+            Config.TEST_ANNOTATIONS,
+            val_tf,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Split test tidak dapat dimuat dari %s + %s: %s",
+            Config.TEST_IMAGES,
+            Config.TEST_ANNOTATIONS,
+            exc,
+        )
+
+    class_names = Config.COCO_CLASSES if hasattr(Config, 'COCO_CLASSES') else [f"Class_{i}" for i in range(Config.NUM_CLASSES)]
+    print_dataset_summary(logger, train_ds, val_ds, test_ds, Config.NUM_CLASSES, class_names)
+    logger.info("Sumber validasi aktif: %s", val_source_name)
+
+    train_loader, val_loader, sampler_report = create_dataloaders(
+        train_ds,
+        val_ds,
+        batch_size=Config.BATCH_SIZE,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=Config.PIN_MEMORY,
+        persistent_workers=Config.PERSISTENT_WORKERS,
+        use_class_balanced_sampler=getattr(Config, 'USE_CLASS_BALANCED_SAMPLER', False),
+        class_balanced_multipliers=getattr(Config, 'CLASS_BALANCED_IMAGE_MULTIPLIER', None),
+        class_balanced_weight_mode=getattr(Config, 'CLASS_BALANCED_IMAGE_WEIGHT_MODE', 'max'),
+    )
+    print_class_balanced_sampler_summary(logger, sampler_report, class_names)
+
+    model = build_detector().to(device)
+    print_model_config(
+        logger,
+        model,
+        Config.NUM_CLASSES,
+        Config.IMAGE_SIZE,
+        Config.BATCH_SIZE,
+        Config.LEARNING_RATE,
+        Config.EPOCHS,
+        device,
+        Config.USE_AMP,
+        get_optimizer_name(),
+    )
+    metric_graph_dir = ensure_metric_graph_dirs()
+
+    criterion = AnchorFreeLoss(num_classes=Config.NUM_CLASSES)
+    optimizer, optimizer_name = build_optimizer(model)
+    scheduler = build_lr_scheduler(optimizer)
+    scaler = GradScaler('cuda', enabled=Config.USE_AMP)
+    start_epoch = 0
+
+    best_val_map50 = 0.0
+    best_val_map5095 = 0.0
+    best_val_map50_epoch = 0
+    best_val_map5095_epoch = 0
+    best_val_acc = 0.0
+    best_val_acc_epoch = 0
+    best_val_bundle = init_metric_bundle(Config.NUM_CLASSES, MULTI_PER_CLASS_ROW_ORDER)
+    best_tr_bundle = init_metric_bundle(Config.NUM_CLASSES, MULTI_PER_CLASS_ROW_ORDER)
+    best_val_multi_globals = init_best_global_metrics()
+    best_tr_multi_globals = init_best_global_metrics()
+
+    h_tr_loss = []
+    h_val_loss = []
+    h_tr_bbox = []
+    h_val_bbox = []
+    h_tr_cls = []
+    h_val_cls = []
+    h_tr_obj = []
+    h_val_obj = []
+    x_tr_metrics = []
+    h_tr_map50 = []
+    h_tr_map5095 = []
+    h_map50 = []
+    h_map5095 = []
+
+    h_multi_acc = []
+    h_multi_sys_acc = []
+    h_multi_acc_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_multi_prec_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_multi_rec_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_multi_f1_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_multi_avg_precision = []
+    h_multi_sys_precision = []
+    h_multi_avg_recall = []
+    h_multi_sys_recall = []
+    h_multi_avg_f1 = []
+    h_multi_sys_f1 = []
+    h_multi_error = []
+
+    h_tr_multi_acc = []
+    h_tr_multi_sys_acc = []
+    h_tr_multi_acc_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_tr_multi_prec_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_tr_multi_rec_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_tr_multi_f1_cls = [[] for _ in range(Config.NUM_CLASSES)]
+    h_tr_multi_avg_precision = []
+    h_tr_multi_sys_precision = []
+    h_tr_multi_avg_recall = []
+    h_tr_multi_sys_recall = []
+    h_tr_multi_avg_f1 = []
+    h_tr_multi_sys_f1 = []
+    h_tr_multi_error = []
+    h_multi_monitor_loss = []
+    h_tr_multi_monitor_loss = []
+
+    btt = float('inf')
+    btb = float('inf')
+    btc = float('inf')
+    bto = float('inf')
+    bvt = float('inf')
+    bvb = float('inf')
+    bvc = float('inf')
+    bvo = float('inf')
+    btt_e = btb_e = btc_e = bto_e = 0
+    bvt_e = bvb_e = bvc_e = bvo_e = 0
+
+    final_train_loss = 0.0
+    final_val_loss = 0.0
+    elapsed_time_offset = 0.0
+    training_session_start = time.time()
+
+    train_eval_freq = max(1, int(getattr(Config, 'TRAIN_EVAL_FREQUENCY', 10)))
+    train_graph_eval_freq = max(1, int(getattr(Config, 'TRAIN_GRAPH_EVAL_FREQUENCY', 1)))
+
+    def current_train_state():
+        return {
+            'best_val_map50': best_val_map50,
+            'best_val_map5095': best_val_map5095,
+            'best_val_map50_epoch': best_val_map50_epoch,
+            'best_val_map5095_epoch': best_val_map5095_epoch,
+            'best_val_acc': best_val_acc,
+            'best_val_acc_epoch': best_val_acc_epoch,
+            'best_val_bundle': best_val_bundle,
+            'best_tr_bundle': best_tr_bundle,
+            'best_val_multi_globals': best_val_multi_globals,
+            'best_tr_multi_globals': best_tr_multi_globals,
+            'h_tr_loss': h_tr_loss,
+            'h_val_loss': h_val_loss,
+            'h_tr_bbox': h_tr_bbox,
+            'h_val_bbox': h_val_bbox,
+            'h_tr_cls': h_tr_cls,
+            'h_val_cls': h_val_cls,
+            'h_tr_obj': h_tr_obj,
+            'h_val_obj': h_val_obj,
+            'x_tr_metrics': x_tr_metrics,
+            'h_tr_map50': h_tr_map50,
+            'h_tr_map5095': h_tr_map5095,
+            'h_map50': h_map50,
+            'h_map5095': h_map5095,
+            'h_multi_acc': h_multi_acc,
+            'h_multi_sys_acc': h_multi_sys_acc,
+            'h_multi_acc_cls': h_multi_acc_cls,
+            'h_multi_prec_cls': h_multi_prec_cls,
+            'h_multi_rec_cls': h_multi_rec_cls,
+            'h_multi_f1_cls': h_multi_f1_cls,
+            'h_multi_avg_precision': h_multi_avg_precision,
+            'h_multi_sys_precision': h_multi_sys_precision,
+            'h_multi_avg_recall': h_multi_avg_recall,
+            'h_multi_sys_recall': h_multi_sys_recall,
+            'h_multi_avg_f1': h_multi_avg_f1,
+            'h_multi_sys_f1': h_multi_sys_f1,
+            'h_multi_error': h_multi_error,
+            'h_tr_multi_acc': h_tr_multi_acc,
+            'h_tr_multi_sys_acc': h_tr_multi_sys_acc,
+            'h_tr_multi_acc_cls': h_tr_multi_acc_cls,
+            'h_tr_multi_prec_cls': h_tr_multi_prec_cls,
+            'h_tr_multi_rec_cls': h_tr_multi_rec_cls,
+            'h_tr_multi_f1_cls': h_tr_multi_f1_cls,
+            'h_tr_multi_avg_precision': h_tr_multi_avg_precision,
+            'h_tr_multi_sys_precision': h_tr_multi_sys_precision,
+            'h_tr_multi_avg_recall': h_tr_multi_avg_recall,
+            'h_tr_multi_sys_recall': h_tr_multi_sys_recall,
+            'h_tr_multi_avg_f1': h_tr_multi_avg_f1,
+            'h_tr_multi_sys_f1': h_tr_multi_sys_f1,
+            'h_tr_multi_error': h_tr_multi_error,
+            'h_multi_monitor_loss': h_multi_monitor_loss,
+            'h_tr_multi_monitor_loss': h_tr_multi_monitor_loss,
+            'btt': btt,
+            'btb': btb,
+            'btc': btc,
+            'bto': bto,
+            'bvt': bvt,
+            'bvb': bvb,
+            'bvc': bvc,
+            'bvo': bvo,
+            'btt_e': btt_e,
+            'btb_e': btb_e,
+            'btc_e': btc_e,
+            'bto_e': bto_e,
+            'bvt_e': bvt_e,
+            'bvb_e': bvb_e,
+            'bvc_e': bvc_e,
+            'bvo_e': bvo_e,
+            'final_train_loss': final_train_loss,
+            'final_val_loss': final_val_loss,
+            'total_train_time': get_realtime_elapsed(training_session_start, elapsed_time_offset),
+        }
+
+    if getattr(args, 'test_only', False):
+        run_test_phase(
+            model=model,
+            criterion=criterion,
+            device=device,
+            class_names=class_names,
+            val_tf=val_tf,
+            logger=logger,
+            epoch_label=0,
+            checkpoint_path=test_only_checkpoint,
+        )
+        logger.info(f"\n  Test-only selesai. Output disimpan di: {Config.RUN_DIR.resolve()}")
+        logger.info(f"  test_results/  ({Config.TEST_VIS_SAMPLES} gambar prediksi)")
+        return
+
+    if resume_checkpoint is not None:
+        ckpt = torch.load(resume_checkpoint, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+
+        if 'optimizer_state_dict' in ckpt:
+            saved_optimizer_name = ckpt.get('optimizer_name')
+            if saved_optimizer_name and saved_optimizer_name != optimizer_name:
+                logger.warning(
+                    "Optimizer checkpoint (%s) berbeda dengan config saat ini (%s). "
+                    "State optimizer lama akan dicoba dimuat; jika tidak cocok akan diabaikan.",
+                    saved_optimizer_name,
+                    optimizer_name,
+                )
+            try:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            except Exception:
+                logger.warning(
+                    "State optimizer dari checkpoint tidak cocok dengan optimizer %s saat ini. "
+                    "Training akan memakai state optimizer baru dari config.py.",
+                    optimizer_name,
+                )
+        if 'scheduler_state_dict' in ckpt:
+            try:
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            except Exception:
+                logger.warning(
+                    "State scheduler dari checkpoint tidak cocok dengan mode scheduler saat ini. "
+                    "Scheduler akan memakai konfigurasi baru dari config.py."
+                )
+        if 'scaler_state_dict' in ckpt:
+            try:
+                scaler.load_state_dict(ckpt['scaler_state_dict'])
+            except Exception:
+                logger.warning("State GradScaler dari checkpoint tidak dapat dimuat. Training tetap dilanjutkan.")
+
+        start_epoch = int(ckpt.get('epoch', 0))
+        resume_state = ckpt.get('train_state', {})
+        best_val_map50 = float(resume_state.get('best_val_map50', best_val_map50))
+        best_val_map5095 = float(resume_state.get('best_val_map5095', best_val_map5095))
+        best_val_map50_epoch = int(resume_state.get('best_val_map50_epoch', best_val_map50_epoch))
+        best_val_map5095_epoch = int(resume_state.get('best_val_map5095_epoch', best_val_map5095_epoch))
+        best_val_acc = float(resume_state.get('best_val_acc', best_val_acc))
+        best_val_acc_epoch = int(resume_state.get('best_val_acc_epoch', best_val_acc_epoch))
+        best_val_bundle = normalize_metric_bundle(
+            resume_state.get('best_val_bundle', best_val_bundle),
+            Config.NUM_CLASSES,
+            metric_rows=MULTI_PER_CLASS_ROW_ORDER,
+        )
+        best_tr_bundle = normalize_metric_bundle(
+            resume_state.get('best_tr_bundle', best_tr_bundle),
+            Config.NUM_CLASSES,
+            metric_rows=MULTI_PER_CLASS_ROW_ORDER,
+        )
+        best_val_multi_globals = normalize_global_metrics(
+            resume_state.get('best_val_multi_globals', best_val_multi_globals)
+        )
+        best_tr_multi_globals = normalize_global_metrics(
+            resume_state.get('best_tr_multi_globals', best_tr_multi_globals)
+        )
+
+        h_tr_loss = resume_state.get('h_tr_loss', h_tr_loss)
+        h_val_loss = resume_state.get('h_val_loss', h_val_loss)
+        h_tr_bbox = resume_state.get('h_tr_bbox', h_tr_bbox)
+        h_val_bbox = resume_state.get('h_val_bbox', h_val_bbox)
+        h_tr_cls = resume_state.get('h_tr_cls', h_tr_cls)
+        h_val_cls = resume_state.get('h_val_cls', h_val_cls)
+        h_tr_obj = resume_state.get('h_tr_obj', h_tr_obj)
+        h_val_obj = resume_state.get('h_val_obj', h_val_obj)
+        x_tr_metrics = resume_state.get('x_tr_metrics', x_tr_metrics)
+        h_tr_map50 = resume_state.get('h_tr_map50', h_tr_map50)
+        h_tr_map5095 = resume_state.get('h_tr_map5095', h_tr_map5095)
+        h_map50 = resume_state.get('h_map50', h_map50)
+        h_map5095 = resume_state.get('h_map5095', h_map5095)
+        h_multi_acc = resume_state.get('h_multi_acc', h_multi_acc)
+        h_multi_sys_acc = resume_state.get('h_multi_sys_acc', h_multi_sys_acc)
+        h_multi_acc_cls = resume_state.get('h_multi_acc_cls', h_multi_acc_cls)
+        h_multi_prec_cls = resume_state.get('h_multi_prec_cls', h_multi_prec_cls)
+        h_multi_rec_cls = resume_state.get('h_multi_rec_cls', h_multi_rec_cls)
+        h_multi_f1_cls = resume_state.get('h_multi_f1_cls', h_multi_f1_cls)
+        h_multi_avg_precision = resume_state.get('h_multi_avg_precision', h_multi_avg_precision)
+        h_multi_sys_precision = resume_state.get('h_multi_sys_precision', h_multi_sys_precision)
+        h_multi_avg_recall = resume_state.get('h_multi_avg_recall', h_multi_avg_recall)
+        h_multi_sys_recall = resume_state.get('h_multi_sys_recall', h_multi_sys_recall)
+        h_multi_avg_f1 = resume_state.get('h_multi_avg_f1', h_multi_avg_f1)
+        h_multi_sys_f1 = resume_state.get('h_multi_sys_f1', h_multi_sys_f1)
+        h_multi_error = resume_state.get('h_multi_error', h_multi_error)
+        h_tr_multi_acc = resume_state.get('h_tr_multi_acc', h_tr_multi_acc)
+        h_tr_multi_sys_acc = resume_state.get('h_tr_multi_sys_acc', h_tr_multi_sys_acc)
+        h_tr_multi_acc_cls = resume_state.get('h_tr_multi_acc_cls', h_tr_multi_acc_cls)
+        h_tr_multi_prec_cls = resume_state.get('h_tr_multi_prec_cls', h_tr_multi_prec_cls)
+        h_tr_multi_rec_cls = resume_state.get('h_tr_multi_rec_cls', h_tr_multi_rec_cls)
+        h_tr_multi_f1_cls = resume_state.get('h_tr_multi_f1_cls', h_tr_multi_f1_cls)
+        h_tr_multi_avg_precision = resume_state.get('h_tr_multi_avg_precision', h_tr_multi_avg_precision)
+        h_tr_multi_sys_precision = resume_state.get('h_tr_multi_sys_precision', h_tr_multi_sys_precision)
+        h_tr_multi_avg_recall = resume_state.get('h_tr_multi_avg_recall', h_tr_multi_avg_recall)
+        h_tr_multi_sys_recall = resume_state.get('h_tr_multi_sys_recall', h_tr_multi_sys_recall)
+        h_tr_multi_avg_f1 = resume_state.get('h_tr_multi_avg_f1', h_tr_multi_avg_f1)
+        h_tr_multi_sys_f1 = resume_state.get('h_tr_multi_sys_f1', h_tr_multi_sys_f1)
+        h_tr_multi_error = resume_state.get('h_tr_multi_error', h_tr_multi_error)
+        h_multi_monitor_loss = resume_state.get('h_multi_monitor_loss', h_multi_monitor_loss)
+        h_tr_multi_monitor_loss = resume_state.get('h_tr_multi_monitor_loss', h_tr_multi_monitor_loss)
+
+        btt = float(resume_state.get('btt', btt))
+        btb = float(resume_state.get('btb', btb))
+        btc = float(resume_state.get('btc', btc))
+        bto = float(resume_state.get('bto', bto))
+        bvt = float(resume_state.get('bvt', bvt))
+        bvb = float(resume_state.get('bvb', bvb))
+        bvc = float(resume_state.get('bvc', bvc))
+        bvo = float(resume_state.get('bvo', bvo))
+        btt_e = int(resume_state.get('btt_e', btt_e))
+        btb_e = int(resume_state.get('btb_e', btb_e))
+        btc_e = int(resume_state.get('btc_e', btc_e))
+        bto_e = int(resume_state.get('bto_e', bto_e))
+        bvt_e = int(resume_state.get('bvt_e', bvt_e))
+        bvb_e = int(resume_state.get('bvb_e', bvb_e))
+        bvc_e = int(resume_state.get('bvc_e', bvc_e))
+        bvo_e = int(resume_state.get('bvo_e', bvo_e))
+        final_train_loss = float(resume_state.get('final_train_loss', final_train_loss))
+        final_val_loss = float(resume_state.get('final_val_loss', final_val_loss))
+        elapsed_time_offset = float(resume_state.get('total_train_time', elapsed_time_offset))
+        training_session_start = time.time()
+
+        logger.info(f"  Resume Epoch     : {start_epoch}")
+        logger.info(f"  Next Epoch       : {start_epoch + 1}")
+        logger.info(f"  Akumulasi Waktu  : {format_time(elapsed_time_offset)}")
+
+    # ── Early Stopping State ──
+    es_enabled = bool(getattr(Config, 'EARLY_STOPPING', False))
+    es_patience = int(getattr(Config, 'EARLY_STOPPING_PATIENCE', 20))
+    es_min_delta = float(getattr(Config, 'EARLY_STOPPING_MIN_DELTA', 0.001))
+    es_metric_name = str(getattr(Config, 'EARLY_STOPPING_METRIC', 'mAP@0.50')).strip().lower()
+    es_counter = 0           # berapa epoch berturut-turut tanpa perbaikan
+    es_best_value = None     # nilai terbaik metrik yang dimonitor
+    es_triggered = False     # flag apakah early stopping terpicu
+    # Untuk metrik val_loss, semakin kecil semakin baik (mode "min").
+    # Untuk metrik lainnya, semakin besar semakin baik (mode "max").
+    es_mode_min = es_metric_name in {'val_loss', 'validation_loss'}
+
+    if es_enabled:
+        logger.info(
+            f"  Early Stopping   : AKTIF (patience={es_patience}, "
+            f"min_delta={es_min_delta}, metric={Config.EARLY_STOPPING_METRIC})"
+        )
+
+    for epoch in range(start_epoch, Config.EPOCHS):
+        cur_epoch = epoch + 1
+        t0 = time.time()
+
+        train_losses = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, cur_epoch, logger=logger)
+        train_time = time.time() - t0
+        final_train_loss = train_losses['total_loss']
+
+        h_tr_loss.append(train_losses['total_loss'])
+        h_tr_bbox.append(train_losses['bbox_loss'])
+        h_tr_cls.append(train_losses['class_loss'])
+        h_tr_obj.append(train_losses['obj_loss'])
+
+        if train_losses['total_loss'] < btt:
+            btt, btt_e = train_losses['total_loss'], cur_epoch
+        if train_losses['bbox_loss'] < btb:
+            btb, btb_e = train_losses['bbox_loss'], cur_epoch
+        if train_losses['class_loss'] < btc:
+            btc, btc_e = train_losses['class_loss'], cur_epoch
+        if train_losses['obj_loss'] < bto:
+            bto, bto_e = train_losses['obj_loss'], cur_epoch
+
+        if cur_epoch % Config.EVAL_FREQUENCY != 0:
+            logger.info(f"Epoch {cur_epoch:03d}/{Config.EPOCHS} | {format_time(train_time)} | TrainLoss={train_losses['total_loss']:.4f}")
+            save_checkpoint(
+                model,
+                optimizer,
+                cur_epoch,
+                {'train_loss': train_losses['total_loss']},
+                'latest_checkpoint.pth',
+                scheduler=scheduler,
+                scaler=scaler,
+                train_state=current_train_state(),
+            )
+            if cur_epoch % getattr(Config, 'SAVE_FREQUENCY', 5) == 0:
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    cur_epoch,
+                    {'train_loss': train_losses['total_loss']},
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    train_state=current_train_state(),
+                )
+            scheduler.step()
+            continue
+
+        t1 = time.time()
+        val_metrics, val_losses, val_class_preds, val_det_preds, val_tgts, _, _ = evaluate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            cur_epoch,
+            logger=logger,
+        )
+        val_time = time.time() - t1
+        final_val_loss = val_losses['total_loss']
+
+        h_val_loss.append(val_losses['total_loss'])
+        h_val_bbox.append(val_losses['bbox_loss'])
+        h_val_cls.append(val_losses['class_loss'])
+        h_val_obj.append(val_losses['obj_loss'])
+
+        if val_losses['total_loss'] < bvt:
+            bvt, bvt_e = val_losses['total_loss'], cur_epoch
+        if val_losses['bbox_loss'] < bvb:
+            bvb, bvb_e = val_losses['bbox_loss'], cur_epoch
+        if val_losses['class_loss'] < bvc:
+            bvc, bvc_e = val_losses['class_loss'], cur_epoch
+        if val_losses['obj_loss'] < bvo:
+            bvo, bvo_e = val_losses['obj_loss'], cur_epoch
+
+        val_bundle = extract_multiclass_bundle(val_metrics, Config.NUM_CLASSES)
+        val_multi_globals = extract_multiclass_global_metrics(val_metrics)
+        update_best_metric_bundle(best_val_bundle, val_bundle)
+        update_best_global_metrics(best_val_multi_globals, val_multi_globals)
+        save_confusion_matrix_bundle(
+            val_class_preds,
+            val_det_preds,
+            val_tgts,
+            class_names=class_names,
+            metric_graph_dir=metric_graph_dir,
+            file_tag='val',
+        )
+
+        cur_acc = val_multi_globals['Average Accuracy']
+        cur_sys_acc = val_multi_globals['System Accuracy']
+        cur_prec = val_multi_globals['System Precision']
+        cur_rec = val_multi_globals['System Recall']
+        cur_f1 = val_multi_globals['System F1']
+        cur_map50 = val_bundle['mAP@0.50']['average']
+        cur_map5095 = val_bundle['mAP@[0.50:0.95]']['average']
+
+        h_map50.append(cur_map50)
+        h_map5095.append(cur_map5095)
+        h_multi_acc.append(val_multi_globals['Average Accuracy'])
+        h_multi_sys_acc.append(val_multi_globals['System Accuracy'])
+        h_multi_avg_precision.append(val_multi_globals['Average Precision'])
+        h_multi_sys_precision.append(val_multi_globals['System Precision'])
+        h_multi_avg_recall.append(val_multi_globals['Average Recall'])
+        h_multi_sys_recall.append(val_multi_globals['System Recall'])
+        h_multi_avg_f1.append(val_multi_globals['Average F1'])
+        h_multi_sys_f1.append(val_multi_globals['System F1'])
+        h_multi_error.append(val_multi_globals['Average Error Rate'])
+        val_monitor_loss = compute_multiclass_monitor_loss(val_multi_globals)
+        h_multi_monitor_loss.append(val_monitor_loss)
+
+        for class_id in range(Config.NUM_CLASSES):
+            h_multi_acc_cls[class_id].append(val_bundle['Accuracy']['per_class'][class_id])
+            h_multi_prec_cls[class_id].append(val_bundle['Precision']['per_class'][class_id])
+            h_multi_rec_cls[class_id].append(val_bundle['Recall']['per_class'][class_id])
+            h_multi_f1_cls[class_id].append(val_bundle['F1-Score']['per_class'][class_id])
+
+        prev_best_map50 = best_val_map50
+        prev_best_map5095 = best_val_map5095
+        prev_best_acc = best_val_acc
+        is_best_map50 = (best_val_map50_epoch == 0) or (cur_map50 > prev_best_map50)
+        is_best_map5095 = (best_val_map5095_epoch == 0) or (cur_map5095 > prev_best_map5095)
+        is_best_acc = (best_val_acc_epoch == 0) or (cur_acc > prev_best_acc)
+
+        if is_best_map50:
+            best_val_map50 = cur_map50
+            best_val_map50_epoch = cur_epoch
+        if is_best_map5095:
+            best_val_map5095 = cur_map5095
+            best_val_map5095_epoch = cur_epoch
+        if is_best_acc:
+            best_val_acc = cur_acc
+            best_val_acc_epoch = cur_epoch
+
+        run_train_table_eval = cur_epoch % train_eval_freq == 0
+        run_train_graph_eval = cur_epoch % train_graph_eval_freq == 0
+        train_monitor_loss_for_log = h_tr_multi_monitor_loss[-1] if h_tr_multi_monitor_loss else float('nan')
+
+        if run_train_graph_eval:
+            if run_train_table_eval:
+                logger.info(f"  [E{cur_epoch}] Menjalankan evaluasi train set untuk per-class metrics...")
+
+            eval_label = "TrainEval" if run_train_table_eval else "TrainGraph"
+            tr_metrics, _, tr_class_preds, tr_det_preds, tr_tgts, _, _ = evaluate(
+                model,
+                train_loader,
+                criterion,
+                device,
+                cur_epoch,
+                label_prefix=eval_label,
+                logger=logger if run_train_table_eval else None,
+                show_progress=run_train_table_eval,
+            )
+            tr_bundle = extract_multiclass_bundle(tr_metrics, Config.NUM_CLASSES)
+            tr_multi_globals = extract_multiclass_global_metrics(tr_metrics)
+            update_best_metric_bundle(best_tr_bundle, tr_bundle)
+            update_best_global_metrics(best_tr_multi_globals, tr_multi_globals)
+
+            x_tr_metrics.append(cur_epoch)
+            h_tr_map50.append(tr_bundle['mAP@0.50']['average'])
+            h_tr_map5095.append(tr_bundle['mAP@[0.50:0.95]']['average'])
+            h_tr_multi_acc.append(tr_multi_globals['Average Accuracy'])
+            h_tr_multi_sys_acc.append(tr_multi_globals['System Accuracy'])
+            h_tr_multi_avg_precision.append(tr_multi_globals['Average Precision'])
+            h_tr_multi_sys_precision.append(tr_multi_globals['System Precision'])
+            h_tr_multi_avg_recall.append(tr_multi_globals['Average Recall'])
+            h_tr_multi_sys_recall.append(tr_multi_globals['System Recall'])
+            h_tr_multi_avg_f1.append(tr_multi_globals['Average F1'])
+            h_tr_multi_sys_f1.append(tr_multi_globals['System F1'])
+            h_tr_multi_error.append(tr_multi_globals['Average Error Rate'])
+            train_monitor_loss_for_log = compute_multiclass_monitor_loss(tr_multi_globals)
+            h_tr_multi_monitor_loss.append(train_monitor_loss_for_log)
+            for class_id in range(Config.NUM_CLASSES):
+                h_tr_multi_acc_cls[class_id].append(tr_bundle['Accuracy']['per_class'][class_id])
+                h_tr_multi_prec_cls[class_id].append(tr_bundle['Precision']['per_class'][class_id])
+                h_tr_multi_rec_cls[class_id].append(tr_bundle['Recall']['per_class'][class_id])
+                h_tr_multi_f1_cls[class_id].append(tr_bundle['F1-Score']['per_class'][class_id])
+
+            if run_train_table_eval:
+                log_multiclass_metrics_dual(
+                    logger,
+                    cur_epoch,
+                    class_names,
+                    val_bundle,
+                    best_val_bundle,
+                    val_multi_globals,
+                    best_val_multi_globals,
+                    tr_bundle,
+                    best_tr_bundle,
+                    tr_multi_globals,
+                    best_tr_multi_globals,
+                )
+
+            save_confusion_matrix_bundle(
+                tr_class_preds,
+                tr_det_preds,
+                tr_tgts,
+                class_names=class_names,
+                metric_graph_dir=metric_graph_dir,
+                file_tag='train',
+            )
+
+            del tr_class_preds, tr_det_preds, tr_tgts
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # Log ringkas train metrics setiap epoch (agar plot_grafik_wide.py bisa parse)
+            logger.info(
+                f"  [TrainMetrics] E{cur_epoch:03d} | "
+                f"TrainmAP50={tr_bundle['mAP@0.50']['average']:.4f} | "
+                f"TrainmAP5095={tr_bundle['mAP@[0.50:0.95]']['average']:.4f} | "
+                f"TrainAvgAcc={tr_multi_globals['Average Accuracy']:.4f} | "
+                f"TrainSysAcc={tr_multi_globals['System Accuracy']:.4f}"
+            )
+
+        epoch_time = train_time + val_time
+        logger.info(
+            f"Epoch {cur_epoch:03d}/{Config.EPOCHS} | {format_time(epoch_time)} | "
+            f"TrainLoss={train_losses['total_loss']:.4f} | ValLoss={val_losses['total_loss']:.4f} | "
+            f"mAP50={cur_map50:.4f} | mAP5095={cur_map5095:.4f} | "
+            f"AvgAccMultiLabel={cur_acc:.4f} | SysAcc={cur_sys_acc:.4f} | "
+            f"Precision={cur_prec:.4f} | Recall={cur_rec:.4f} | F1={cur_f1:.4f}"
+        )
+
+        x_tr = list(range(1, len(h_tr_loss) + 1))
+        x_val = [i for i in range(1, len(h_tr_loss) + 1) if i % Config.EVAL_FREQUENCY == 0][:len(h_val_loss)]
+        update_multiclass_plots(
+            x_tr=x_tr,
+            x_val=x_val,
+            loss_histories={
+                'train_total': h_tr_loss,
+                'val_total': h_val_loss,
+                'train_bbox': h_tr_bbox,
+                'val_bbox': h_val_bbox,
+                'train_cls': h_tr_cls,
+                'val_cls': h_val_cls,
+                'train_obj': h_tr_obj,
+                'val_obj': h_val_obj,
+            },
+            x_tr_metrics=x_tr_metrics,
+            train_global_hist={
+                'avg_acc': h_tr_multi_acc,
+                'sys_acc': h_tr_multi_sys_acc,
+                'avg_precision': h_tr_multi_avg_precision,
+                'sys_precision': h_tr_multi_sys_precision,
+                'avg_recall': h_tr_multi_avg_recall,
+                'sys_recall': h_tr_multi_sys_recall,
+                'avg_f1': h_tr_multi_avg_f1,
+                'sys_f1': h_tr_multi_sys_f1,
+                'error_rate': h_tr_multi_error,
+                'monitor_loss': h_tr_multi_monitor_loss,
+            },
+            val_global_hist={
+                'avg_acc': h_multi_acc,
+                'sys_acc': h_multi_sys_acc,
+                'avg_precision': h_multi_avg_precision,
+                'sys_precision': h_multi_sys_precision,
+                'avg_recall': h_multi_avg_recall,
+                'sys_recall': h_multi_sys_recall,
+                'avg_f1': h_multi_avg_f1,
+                'sys_f1': h_multi_sys_f1,
+                'error_rate': h_multi_error,
+                'monitor_loss': h_multi_monitor_loss,
+            },
+            train_class_hist={
+                'accuracy': h_tr_multi_acc_cls,
+                'precision': h_tr_multi_prec_cls,
+                'recall': h_tr_multi_rec_cls,
+                'f1': h_tr_multi_f1_cls,
+            },
+            val_class_hist={
+                'accuracy': h_multi_acc_cls,
+                'precision': h_multi_prec_cls,
+                'recall': h_multi_rec_cls,
+                'f1': h_multi_f1_cls,
+            },
+            h_map50_train=h_tr_map50,
+            h_map5095_train=h_tr_map5095,
+            h_map50_val=h_map50,
+            h_map5095_val=h_map5095,
+            class_names=class_names,
+            output_dir=metric_graph_dir,
+        )
+
+        checkpoint_metric = str(getattr(Config, 'CHECKPOINT_METRIC', 'mAP@0.50')).strip().lower()
+        if checkpoint_metric in {'accuracy', 'avgaccmulti', 'average accuracy', 'average_accuracy'}:
+            is_primary_best = is_best_acc
+        elif checkpoint_metric in {'map@[0.50:0.95]', 'map5095', 'map50:95'}:
+            is_primary_best = is_best_map5095
+        else:
+            is_primary_best = is_best_map50
+
+        if is_primary_best:
+            save_confusion_matrix_bundle(
+                val_class_preds,
+                val_det_preds,
+                val_tgts,
+                class_names=class_names,
+                metric_graph_dir=metric_graph_dir,
+                file_tag='val',
+            )
+
+        if is_primary_best:
+            save_checkpoint(
+                model,
+                optimizer,
+                cur_epoch,
+                val_metrics,
+                'best_model.pth',
+                scheduler=scheduler,
+                scaler=scaler,
+                train_state=current_train_state(),
+            )
+        if is_best_acc:
+            save_checkpoint(
+                model,
+                optimizer,
+                cur_epoch,
+                val_metrics,
+                'best_accuracy_multi_model.pth',
+                scheduler=scheduler,
+                scaler=scaler,
+                train_state=current_train_state(),
+            )
+        if is_best_map50:
+            save_checkpoint(
+                model,
+                optimizer,
+                cur_epoch,
+                val_metrics,
+                'best_map_model.pth',
+                scheduler=scheduler,
+                scaler=scaler,
+                train_state=current_train_state(),
+            )
+            save_checkpoint(
+                model,
+                optimizer,
+                cur_epoch,
+                val_metrics,
+                'best_map50_model.pth',
+                scheduler=scheduler,
+                scaler=scaler,
+                train_state=current_train_state(),
+            )
+        if is_best_map5095:
+            save_checkpoint(
+                model,
+                optimizer,
+                cur_epoch,
+                val_metrics,
+                'best_map5095_model.pth',
+                scheduler=scheduler,
+                scaler=scaler,
+                train_state=current_train_state(),
+            )
+        save_checkpoint(
+            model,
+            optimizer,
+            cur_epoch,
+            val_metrics,
+            'latest_checkpoint.pth',
+            scheduler=scheduler,
+            scaler=scaler,
+            train_state=current_train_state(),
+        )
+        if cur_epoch % getattr(Config, 'SAVE_FREQUENCY', 5) == 0:
+            save_checkpoint(
+                model,
+                optimizer,
+                cur_epoch,
+                val_metrics,
+                scheduler=scheduler,
+                scaler=scaler,
+                train_state=current_train_state(),
+            )
+
+        del val_class_preds, val_det_preds, val_tgts
+        gc.collect()
+        torch.cuda.empty_cache()
+        scheduler.step()
+
+        # ── Early Stopping Check ──
+        if es_enabled:
+            # Tentukan nilai metrik yang dimonitor pada epoch ini
+            if es_metric_name in {'val_loss', 'validation_loss'}:
+                es_current = val_losses['total_loss']
+            elif es_metric_name in {'map@[0.50:0.95]', 'map5095', 'map50:95'}:
+                es_current = cur_map5095
+            elif es_metric_name in {'accuracy', 'avgaccmulti', 'average accuracy', 'average_accuracy'}:
+                es_current = cur_acc
+            else:  # default: mAP@0.50
+                es_current = cur_map50
+
+            if es_best_value is None:
+                es_best_value = es_current
+                es_counter = 0
+            else:
+                if es_mode_min:
+                    improved = es_current < (es_best_value - es_min_delta)
+                else:
+                    improved = es_current > (es_best_value + es_min_delta)
+
+                if improved:
+                    es_best_value = es_current
+                    es_counter = 0
+                    logger.info(
+                        f"  [EarlyStopping] Metrik membaik → "
+                        f"{Config.EARLY_STOPPING_METRIC}={es_current:.4f} | counter di-reset"
+                    )
+                else:
+                    es_counter += 1
+                    logger.info(
+                        f"  [EarlyStopping] Tidak ada perbaikan → "
+                        f"{Config.EARLY_STOPPING_METRIC}={es_current:.4f} "
+                        f"(best={es_best_value:.4f}) | counter={es_counter}/{es_patience}"
+                    )
+
+            if es_counter >= es_patience:
+                logger.info(
+                    f"\n  ══ EARLY STOPPING TERPICU ══"
+                    f"\n  Training dihentikan di Epoch {cur_epoch} karena "
+                    f"{Config.EARLY_STOPPING_METRIC} tidak membaik selama {es_patience} epoch berturut-turut."
+                    f"\n  Nilai terbaik: {es_best_value:.4f}"
+                )
+                es_triggered = True
+                break
+
+    total_elapsed = get_realtime_elapsed(training_session_start, elapsed_time_offset)
+    if es_triggered:
+        logger.info(
+            f"\n  TRAINING DIHENTIKAN (Early Stopping) di Epoch {cur_epoch}/{Config.EPOCHS} | "
+            f"Waktu total: {format_time(total_elapsed)}"
+        )
+    else:
+        logger.info(
+            f"\n  TRAINING SELESAI | Waktu total: {format_time(total_elapsed)}"
+        )
+    checkpoint_metric = str(getattr(Config, 'CHECKPOINT_METRIC', 'mAP@0.50')).strip().lower()
+    map50_primary_note = " [checkpoint utama]" if checkpoint_metric not in {
+        'accuracy', 'avgaccmulti', 'average accuracy', 'average_accuracy',
+        'map@[0.50:0.95]', 'map5095', 'map50:95',
+    } else ""
+    map5095_primary_note = " [checkpoint utama]" if checkpoint_metric in {
+        'map@[0.50:0.95]', 'map5095', 'map50:95',
+    } else ""
+    acc_primary_note = " [checkpoint utama]" if checkpoint_metric in {
+        'accuracy', 'avgaccmulti', 'average accuracy', 'average_accuracy',
+    } else ""
+    logger.info(
+        f"  Best Val mAP@0.50 : {best_val_map50:.4f}  (Epoch {best_val_map50_epoch})"
+        f"{map50_primary_note}"
+    )
+    logger.info(
+        f"  Best Val mAP@[0.50:0.95] : {best_val_map5095:.4f}  (Epoch {best_val_map5095_epoch})"
+        f"{map5095_primary_note}"
+    )
+    logger.info(
+        f"  Best Val Avg Accuracy Multi-Label : {best_val_acc:.4f}  (Epoch {best_val_acc_epoch})"
+        f"{acc_primary_note}"
+    )
+
+    test_bundle = run_test_phase(
+        model=model,
+        criterion=criterion,
+        device=device,
+        class_names=class_names,
+        val_tf=val_tf,
+        logger=logger,
+        epoch_label=Config.EPOCHS,
+        checkpoint_path=Config.CHECKPOINT_DIR / 'best_model.pth',
+    )
+
+    print_final_summary(
+        logger,
+        class_names,
+        best_val_map50_epoch,
+        best_val_acc_epoch,
+        best_val_bundle,
+        best_tr_bundle,
+        best_val_multi_globals,
+        best_tr_multi_globals,
+        test_bundle,
+        final_train_loss,
+        final_val_loss,
+        Config.EPOCHS,
+        btt,
+        btt_e,
+        btb,
+        btb_e,
+        btc,
+        btc_e,
+        bto,
+        bto_e,
+        bvt,
+        bvt_e,
+        bvb,
+        bvb_e,
+        bvc,
+        bvc_e,
+        bvo,
+        bvo_e,
+    )
+
+    logger.info(f"\n  Semua output tersimpan di: {Config.RUN_DIR.resolve()}")
+    logger.info("  checkpoints/   (model .pth)")
+    logger.info("  logs/          (file .log)")
+    logger.info(f"  graphs/        ({len(list(Config.GRAPHS_DIR.rglob('*.png')))} grafik .png di multi_label/)")
+    logger.info("  test_results/  (gambar prediksi)")
+
+    stage2_classifier_enabled = bool(getattr(Config, "ENABLE_STAGE2_CLASSIFIER", True))
+    if not getattr(args, "detector_only", False) and stage2_classifier_enabled:
+        logger.info("\n" + "=" * 70)
+        logger.info("  LANJUT TRAINING STAGE-2 CLASSIFIER")
+        logger.info("=" * 70)
+        try:
+            cls_result = train_stage2_classifier()
+            logger.info(
+                f"  Stage-2 classifier selesai | "
+                f"best_safety_score={cls_result['best_score']:.4f}"
+            )
+            logger.info(f"  Best classifier checkpoint   : {cls_result['best_path']}")
+            logger.info(f"  Latest classifier checkpoint : {cls_result['latest_path']}")
+        except Exception as exc:
+            import traceback
+            logger.error(
+                "Training stage-2 classifier gagal: %s\n%s",
+                exc,
+                traceback.format_exc(),
+            )
+    elif getattr(args, "detector_only", False):
+        logger.info("\n  Stage-2 classifier dilewati karena --detector-only aktif.")
+    else:
+        logger.info("\n  Stage-2 classifier dilewati karena Config.ENABLE_STAGE2_CLASSIFIER=False.")
+
+    # Putar alarm terus menerus sampai user menekan Enter.
+    play_alert_until_action()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--checkpoint', type=str, default=None)
+    parser.add_argument('--detector-only', action='store_true')
+    parser.add_argument('--test-only', action='store_true')
+    parser.add_argument('--vis-samples', type=int, default=None)
+    args = parser.parse_args()
+    try:
+        train(args)
+    except Exception:
+        play_error_alert_sequence()
+        raise
